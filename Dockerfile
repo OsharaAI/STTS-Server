@@ -43,6 +43,9 @@ RUN if [ "$RUNTIME" = "nvidia" ]; then \
 # Copy the rest of the application code
 COPY . .
 
+# Add chatterbox package to PYTHONPATH for multilingual TTS support
+ENV PYTHONPATH="/app:${PYTHONPATH}"
+
 # Create required directories for the application (fixed syntax error)
 RUN mkdir -p model_cache reference_audio outputs voices logs hf_cache
 

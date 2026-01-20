@@ -2,21 +2,21 @@ version: '3.8'
 
 services:
   # Caddy reverse proxy for HTTPS
-  caddy:
-    image: caddy:2-alpine
-    command: sh -c "apk add --no-cache nss-tools && caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
-      - caddy_data:/data
-      - caddy_config:/config
-    networks:
-      - chatterbox-network
-    depends_on:
-      - chatterbox-tts-server
+  # caddy:
+  #   image: caddy:2-alpine
+  #   command: sh -c "apk add --no-cache nss-tools && caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"
+  #   restart: unless-stopped
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./Caddyfile:/etc/caddy/Caddyfile
+  #     - caddy_data:/data
+  #     - caddy_config:/config
+  #   networks:
+  #     - chatterbox-network
+  #   depends_on:
+  #     - chatterbox-tts-server
 
   chatterbox-tts-server:
     build:
@@ -69,7 +69,7 @@ services:
 # Define the named volumes
 volumes:
   hf_cache:
-  caddy_data:
+  # caddy_data:
   caddy_config:
 
 # Define the network for service communication

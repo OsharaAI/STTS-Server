@@ -12,6 +12,7 @@ import time
 import uuid
 import yaml  # For loading presets
 import numpy as np
+import torch  # For device detection in multilingual TTS
 import librosa  # For potential direct use if needed, though utils.py handles most
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -73,8 +74,10 @@ import utils  # Utility functions
 from pydantic import BaseModel, Field
 
 # Import routers
-from routers import stt, conversation, websocket_stt, websocket_conversation, websocket_conversation_v2
+from routers import stt, conversation
+from routers.websocket import websocket_stt, websocket_conversation, websocket_conversation_v2
 from routers.stt import get_stt_engine
+from routers import multilingual_tts
 
 
 class OpenAISpeechRequest(BaseModel):
@@ -179,6 +182,31 @@ async def lifespan(app: FastAPI):
         else:
             logger.info("STT Model loaded successfully.")
         
+        # Initialize and load Multilingual TTS model
+        logger.info("Attempting to load Multilingual TTS model...")
+        try:
+            logger.info("Importing ChatterboxMultilingualTTS from chatterbox.mtl_tts...")
+            from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+            logger.info("Import successful. Loading Chatterbox Multilingual TTS model...")
+            
+            # Determine device
+            if torch.cuda.is_available():
+                mtl_device = "cuda"
+            elif torch.backends.mps.is_available():
+                mtl_device = "mps"
+            else:
+                mtl_device = "cpu"
+            
+            logger.info(f"Initializing multilingual TTS model on device: {mtl_device}")
+            app.state.multilingual_tts_model = ChatterboxMultilingualTTS.from_pretrained(device=mtl_device)
+            logger.info(f"Multilingual TTS model loaded successfully on {mtl_device}")
+        except ImportError as ie:
+            logger.warning(f"Failed to import Multilingual TTS module: {ie}. Multilingual TTS endpoints will not work.")
+            app.state.multilingual_tts_model = None
+        except Exception as e:
+            logger.warning(f"Failed to load Multilingual TTS model: {e}. Multilingual TTS endpoints will not work.", exc_info=True)
+            app.state.multilingual_tts_model = None
+        
         if tts_loaded:  # Only open browser if TTS (primary functionality) is working
             host_address = get_host()
             server_port = get_port()
@@ -225,6 +253,7 @@ app.include_router(conversation.router)
 app.include_router(websocket_stt.router)
 app.include_router(websocket_conversation.router)
 app.include_router(websocket_conversation_v2.router)  # New modular conversation library
+app.include_router(multilingual_tts.router)  # Multilingual TTS
 
 # --- Static Files and HTML Templates ---
 ui_static_path = Path(__file__).parent / "ui"
@@ -790,6 +819,7 @@ async def custom_tts_endpoint(
                 seed=(
                     request.seed if request.seed is not None else get_gen_default_seed()
                 ),
+                language_id=request.language_id,
             )
             perf_monitor.record(f"Engine synthesized chunk {i+1}")
 
@@ -1018,6 +1048,215 @@ async def speech_to_text_endpoint(
         await audio_file.close()
 
 
+@app.post(
+    "/generate",
+    tags=["TTS Generation"],
+    summary="Generate speech with reference audio and advanced parameters",
+    responses={
+        200: {
+            "content": {"audio/wav": {}},
+            "description": "Successful audio generation.",
+        },
+        400: {
+            "model": ErrorResponse,
+            "description": "Invalid request parameters or input.",
+        },
+        503: {
+            "model": ErrorResponse,
+            "description": "TTS engine not available or model not loaded.",
+        },
+    },
+)
+async def generate_speech_endpoint(
+    text: str = Form(..., description="Text to convert to speech"),
+    reference_audio: Optional[UploadFile] = File(None, description="Optional reference audio file for voice cloning"),
+    exaggeration: float = Form(0.5, description="Voice exaggeration level (0.25-2.0)"),
+    temperature: float = Form(0.8, description="Sampling temperature (0.05-5.0)"),
+    seed: int = Form(0, description="Random seed (0 for random)"),
+    diffusion_steps: int = Form(10, description="Number of diffusion steps (1-15)"),
+    min_p: float = Form(0.05, description="Minimum probability sampler (0.0-1.0)"),
+    top_p: float = Form(1.0, description="Top-p/nucleus sampling (0.0-1.0)"),
+    repetition_penalty: float = Form(1.2, description="Repetition penalty (1.0-2.0)"),
+    split_text: bool = Form(True, description="Whether to split text into chunks"),
+    chunk_size: int = Form(120, description="Target chunk size for text splitting (50-500)", ge=50, le=500),
+    language_id: Optional[str] = Form('hi', description="Language code for multilingual model (e.g., 'en', 'fr', 'es', 'zh')"),
+):
+    """
+    Generates speech audio from text with advanced parameters and optional reference audio for voice cloning.
+    Returns audio as WAV format.
+    """
+    if not engine.MODEL_LOADED:
+        logger.error("Generate request failed: Model not loaded.")
+        raise HTTPException(
+            status_code=503,
+            detail="TTS engine model is not currently loaded or available.",
+        )
+    
+    logger.info(f"Received /generate request with text: '{text[:50]}...', reference_audio: '{reference_audio.filename if reference_audio else 'None'}', language_id: {language_id}")
+    
+    # Handle reference audio if provided
+    audio_prompt_path: Optional[Path] = None
+    temp_ref_audio_path: Optional[Path] = None
+    
+    if reference_audio and reference_audio.filename:
+        # Validate file extension
+        allowed_extensions = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
+        file_ext = Path(reference_audio.filename).suffix.lower()
+        if file_ext not in allowed_extensions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported reference audio format: {file_ext}. Supported: {', '.join(allowed_extensions)}"
+            )
+        
+        # Save reference audio temporarily
+        temp_ref_audio_path = get_output_path() / f"temp_ref_{uuid.uuid4().hex[:8]}{file_ext}"
+
+        try:
+            with open(temp_ref_audio_path, "wb") as buffer:
+                shutil.copyfileobj(reference_audio.file, buffer)
+
+            # Validate reference audio
+            max_dur = config_manager.get_int("audio_output.max_reference_duration_sec", 30)
+
+            audio_prompt_path = temp_ref_audio_path
+            logger.info(f"Using uploaded reference audio: {reference_audio.filename}")
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error processing reference audio: {e}", exc_info=True)
+            if temp_ref_audio_path and temp_ref_audio_path.exists():
+                temp_ref_audio_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=f"Failed to process reference audio: {str(e)}")
+        finally:
+            await reference_audio.close()
+    
+    # Initialize audio collection and sample rate tracking
+    all_audio_segments_np: List[np.ndarray] = []
+    engine_output_sample_rate: Optional[int] = None
+    
+    # Handle text chunking
+    if split_text and len(text) > (chunk_size * 1.5):
+        logger.info(f"Splitting text into chunks of size ~{chunk_size}.")
+        text_chunks = utils.chunk_text_by_sentences(text, chunk_size)
+    else:
+        text_chunks = [text]
+        logger.info("Processing text as a single chunk (splitting not enabled or text too short).")
+    
+    if not text_chunks:
+        raise HTTPException(status_code=400, detail="Text processing resulted in no usable chunks.")
+    
+    # Process each chunk
+    for i, chunk in enumerate(text_chunks):
+        logger.info(f"Synthesizing chunk {i+1}/{len(text_chunks)}...")
+        try:
+            chunk_audio_tensor, chunk_sr_from_engine = engine.synthesize(
+                text=chunk,
+                audio_prompt_path=str(audio_prompt_path) if audio_prompt_path else None,
+                temperature=temperature,
+                exaggeration=exaggeration,
+                cfg_weight=get_gen_default_cfg_weight(),
+                seed=seed,
+                language_id=language_id,
+            )
+            
+            if chunk_audio_tensor is None or chunk_sr_from_engine is None:
+                error_detail = f"TTS engine failed to synthesize audio for chunk {i+1}."
+                logger.error(error_detail)
+                raise HTTPException(status_code=500, detail=error_detail)
+            
+            if engine_output_sample_rate is None:
+                engine_output_sample_rate = chunk_sr_from_engine
+            elif engine_output_sample_rate != chunk_sr_from_engine:
+                logger.warning(
+                    f"Inconsistent sample rate from engine: chunk {i+1} ({chunk_sr_from_engine}Hz) "
+                    f"differs from previous ({engine_output_sample_rate}Hz). Using first chunk's SR."
+                )
+            
+            # Convert to numpy and collect
+            processed_audio_np = chunk_audio_tensor.cpu().numpy().squeeze()
+            all_audio_segments_np.append(processed_audio_np)
+            
+        except HTTPException as http_exc:
+            raise http_exc
+        except Exception as e_chunk:
+            error_detail = f"Error processing audio chunk {i+1}: {str(e_chunk)}"
+            logger.error(error_detail, exc_info=True)
+            raise HTTPException(status_code=500, detail=error_detail)
+    
+    if not all_audio_segments_np:
+        logger.error("No audio segments were successfully generated.")
+        raise HTTPException(status_code=500, detail="Audio generation resulted in no output.")
+    
+    if engine_output_sample_rate is None:
+        logger.error("Engine output sample rate could not be determined.")
+        raise HTTPException(status_code=500, detail="Failed to determine engine sample rate.")
+    
+    try:
+        # Concatenate all chunks into final audio
+        final_audio_np = (
+            np.concatenate(all_audio_segments_np)
+            if len(all_audio_segments_np) > 1
+            else all_audio_segments_np[0]
+        )
+        logger.info(f"All {len(all_audio_segments_np)} audio chunks processed and concatenated")
+        
+        # Apply global audio processing
+        if config_manager.get_bool("audio_processing.enable_silence_trimming", False):
+            final_audio_np = utils.trim_lead_trail_silence(final_audio_np, engine_output_sample_rate)
+            logger.debug("Global silence trim applied")
+        
+        if config_manager.get_bool("audio_processing.enable_internal_silence_fix", False):
+            final_audio_np = utils.fix_internal_silence(final_audio_np, engine_output_sample_rate)
+            logger.debug("Global internal silence fix applied")
+        
+        if (
+            config_manager.get_bool("audio_processing.enable_unvoiced_removal", False)
+            and utils.PARSELMOUTH_AVAILABLE
+        ):
+            final_audio_np = utils.remove_long_unvoiced_segments(final_audio_np, engine_output_sample_rate)
+            logger.debug("Global unvoiced removal applied")
+        
+        # Encode the audio to WAV format
+        encoded_audio = utils.encode_audio(
+            audio_array=final_audio_np,
+            sample_rate=engine_output_sample_rate,
+            output_format="wav",
+            target_sample_rate=get_audio_sample_rate(),
+        )
+        
+    except ValueError as e_concat:
+        logger.error(f"Audio concatenation failed: {e_concat}", exc_info=True)
+        for idx, seg in enumerate(all_audio_segments_np):
+            logger.error(f"Segment {idx} shape: {seg.shape}, dtype: {seg.dtype}")
+        raise HTTPException(status_code=500, detail=f"Audio concatenation error: {e_concat}")
+    except Exception as e:
+        logger.error(f"Error during audio processing: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Audio processing error: {str(e)}")
+    
+    if encoded_audio is None or len(encoded_audio) < 100:
+        raise HTTPException(
+            status_code=500, detail="Failed to encode audio or generated invalid audio."
+        )
+    
+    # Prepare response
+    timestamp_str = time.strftime("%Y%m%d_%H%M%S")
+    download_filename = utils.sanitize_filename(f"generated_{timestamp_str}.wav")
+    headers = {"Content-Disposition": f'attachment; filename="{download_filename}"'}
+    
+    logger.info(f"Successfully generated audio: {download_filename}, {len(encoded_audio)} bytes")
+    
+    # Clean up temporary reference audio file
+    if temp_ref_audio_path and temp_ref_audio_path.exists():
+        temp_ref_audio_path.unlink(missing_ok=True)
+    
+    return StreamingResponse(
+        io.BytesIO(encoded_audio), 
+        media_type="audio/wav", 
+        headers=headers
+    )
+
+
 @app.post("/v1/audio/speech", tags=["OpenAI Compatible"])
 async def openai_speech_endpoint(request: OpenAISpeechRequest):
     # Determine the audio prompt path based on the voice parameter
@@ -1056,6 +1295,7 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
             exaggeration=get_gen_default_exaggeration(),
             cfg_weight=get_gen_default_cfg_weight(),
             seed=seed_to_use,
+            language_id=request.language_id,
         )
 
         if audio_tensor is None or sr is None:

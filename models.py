@@ -41,6 +41,10 @@ class GenerationParams(BaseModel):
         None,
         description="Language of the text. (Primarily for UI, actual engine may infer)",
     )
+    language_id: Optional[str] = Field(
+        None,
+        description="Language code for multilingual model (e.g., 'en', 'fr', 'es', 'zh'). Supports 23 languages when using multilingual model.",
+    )
 
 
 class CustomTTSRequest(BaseModel):
@@ -92,6 +96,9 @@ class CustomTTSRequest(BaseModel):
     )
     language: Optional[str] = Field(
         None, description="Overrides default language if provided."
+    )
+    language_id: Optional[str] = Field(
+        None, description="Language code for multilingual TTS (e.g., 'en', 'fr', 'es', 'zh')."
     )
 
 

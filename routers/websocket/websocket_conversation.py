@@ -17,7 +17,7 @@ from stt_engine import STTEngine
 from models import TranscriptionResult
 import engine
 import utils
-from routers.websocket_stt import PCMAudioDecoder, OptimizedAudioBuffer
+from routers.websocket.websocket_stt import PCMAudioDecoder, OptimizedAudioBuffer
 
 # Import new conversation components
 from pause_detection import PauseDetector, EnergyFallbackDetector, WEBRTC_AVAILABLE
