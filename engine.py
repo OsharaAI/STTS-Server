@@ -5,7 +5,7 @@ import logging
 import random
 import numpy as np
 import torch
-from typing import Optional, Tuple
+from typing import Any, Generator, Optional, Tuple
 from pathlib import Path
 
 from chatterbox.tts import ChatterboxTTS  # Main TTS engine class
@@ -319,4 +319,88 @@ def synthesize(
         return None, None
 
 
-# --- End File: engine.py ---
+
+def synthesize_stream(
+    text: str,
+    audio_prompt_path: Optional[str] = None,
+    temperature: float = 0.8,
+    exaggeration: float = 0.5,
+    cfg_weight: float = 0.5,
+    seed: int = 0,
+    chunk_size: int = 25,
+    language_id: Optional[str] = None,
+) -> Generator[Tuple[Optional[torch.Tensor], Optional[Any]], None, None]:
+    """
+    Synthesizes audio stream from text using the loaded TTS model.
+
+    Yields:
+        Tuple of (audio_chunk, metrics)
+    """
+    global chatterbox_model
+
+    if not MODEL_LOADED or chatterbox_model is None:
+        logger.error("TTS model is not loaded. Cannot synthesize audio.")
+        yield None, None
+        return
+
+    logger.info(f"\nSynthesizing stream: {text[:50]}... language_id: {language_id}")
+
+    try:
+        if seed != 0:
+            set_seed(seed)
+
+        if language_id is None:
+            language_id = config_manager.get_string("generation_defaults.language", "en")
+
+        # Check for language_id support
+        import inspect
+
+        # Check if generate_stream exists; if not, fall back to generate()
+        use_streaming = hasattr(chatterbox_model, 'generate_stream')
+
+        if use_streaming:
+            generate_stream_signature = inspect.signature(chatterbox_model.generate_stream)
+            supports_language_id = 'language_id' in generate_stream_signature.parameters
+
+            kwargs = {
+                "text": text,
+                "audio_prompt_path": audio_prompt_path,
+                "temperature": temperature,
+                "exaggeration": exaggeration,
+                "cfg_weight": cfg_weight,
+                "chunk_size": chunk_size,
+            }
+
+            if supports_language_id:
+                kwargs["language_id"] = language_id
+            elif language_id and language_id != "en":
+                logger.warning(
+                    f"Language '{language_id}' requested but model does not support it in streaming mode."
+                )
+
+            for audio_chunk, metrics in chatterbox_model.generate_stream(**kwargs):
+                yield audio_chunk, metrics
+        else:
+            # Fallback: use non-streaming generate() and yield full audio as one chunk
+            logger.warning("Model does not support generate_stream, falling back to generate()")
+            generate_signature = inspect.signature(chatterbox_model.generate)
+            supports_language_id = 'language_id' in generate_signature.parameters
+
+            kwargs = {
+                "text": text,
+                "audio_prompt_path": audio_prompt_path,
+                "temperature": temperature,
+                "exaggeration": exaggeration,
+                "cfg_weight": cfg_weight,
+            }
+
+            if supports_language_id:
+                kwargs["language_id"] = language_id
+
+            audio = chatterbox_model.generate(**kwargs)
+            yield audio, {}
+
+    except Exception as e:
+        logger.error(f"Error during streaming TTS synthesis: {e}", exc_info=True)
+        yield None, None
+

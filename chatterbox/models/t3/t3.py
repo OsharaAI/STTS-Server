@@ -1,7 +1,7 @@
 # Copyright (c) 2025 Resemble AI
 # MIT License
 import logging
-from typing import Union, Optional, List
+from typing import Union, Optional, List, Generator
 
 logger = logging.getLogger(__name__)
 
@@ -410,6 +410,118 @@ class T3(nn.Module):
         # Concatenate all predicted tokens along the sequence dimension.
         predicted_tokens = torch.cat(predicted, dim=1)  # shape: (B, num_tokens)
         return predicted_tokens
+
+    def inference_stream(
+        self,
+        *,
+        t3_cond: T3Cond,
+        text_tokens: Tensor,
+        max_new_tokens=1000,
+        temperature=0.8,
+        cfg_weight=0.5,
+        chunk_size=25,
+    ) -> Generator[Tensor, None, None]:
+        """
+        Streaming version of T3 inference that yields speech tokens in chunks.
+        Adapted from chatterbox-streaming.
+        """
+        text_tokens = torch.atleast_2d(text_tokens).to(dtype=torch.long, device=self.device)
+        initial_speech_tokens = self.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
+
+        embeds, len_cond = self.prepare_input_embeds(
+            t3_cond=t3_cond,
+            text_tokens=text_tokens,
+            speech_tokens=initial_speech_tokens,
+        )
+
+        if not self.compiled:
+            alignment_stream_analyzer = None
+            if self.hp.is_multilingual:
+                alignment_stream_analyzer = AlignmentStreamAnalyzer(
+                    self.tfmr,
+                    None,
+                    text_tokens_slice=(len_cond, len_cond + text_tokens.size(-1)),
+                    alignment_layer_idx=9,
+                    eos_idx=self.hp.stop_speech_token,
+                )
+            patched_model = T3HuggingfaceBackend(
+                config=self.cfg,
+                llama=self.tfmr,
+                speech_enc=self.speech_emb,
+                speech_head=self.speech_head,
+                alignment_stream_analyzer=alignment_stream_analyzer,
+            )
+            self.patched_model = patched_model
+            self.compiled = True
+
+        device = embeds.device
+
+        bos_token = torch.tensor([[self.hp.start_speech_token]], dtype=torch.long, device=device)
+        bos_embed = self.speech_emb(bos_token)
+        bos_embed = bos_embed + self.speech_pos_emb.get_fixed_embedding(0)
+        bos_embed = torch.cat([bos_embed, bos_embed])  # batch_size=2 for CFG
+
+        inputs_embeds = torch.cat([embeds, bos_embed], dim=1)
+
+        generated_ids = bos_token.clone()
+        predicted = []
+        chunk_buffer = []
+
+        top_p_warper = TopPLogitsWarper(top_p=0.8)
+        repetition_penalty_processor = RepetitionPenaltyLogitsProcessor(penalty=2.0)
+
+        output = self.patched_model(
+            inputs_embeds=inputs_embeds,
+            past_key_values=None,
+            use_cache=True,
+            output_attentions=True,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        past = output.past_key_values
+
+        for i in range(max_new_tokens):
+            logits = output.logits[:, -1, :]
+
+            logits_cond = logits[0:1]
+            logits_uncond = logits[1:2]
+            logits = logits_cond + cfg_weight * (logits_cond - logits_uncond)
+            logits = logits.squeeze(1)
+
+            if temperature != 1.0:
+                logits = logits / temperature
+
+            logits = repetition_penalty_processor(generated_ids, logits)
+            logits = top_p_warper(None, logits)
+
+            probs = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+
+            predicted.append(next_token)
+            chunk_buffer.append(next_token)
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+
+            if next_token.view(-1) == self.hp.stop_speech_token:
+                if chunk_buffer:
+                    yield torch.cat(chunk_buffer, dim=1)
+                break
+
+            if len(chunk_buffer) >= chunk_size:
+                yield torch.cat(chunk_buffer, dim=1)
+                chunk_buffer = []
+
+            next_token_embed = self.speech_emb(next_token)
+            next_token_embed = next_token_embed + self.speech_pos_emb.get_fixed_embedding(i + 1)
+            next_token_embed = torch.cat([next_token_embed, next_token_embed])  # For CFG
+
+            output = self.patched_model(
+                inputs_embeds=next_token_embed,
+                past_key_values=past,
+                output_attentions=True,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            past = output.past_key_values
 
     @torch.inference_mode()
     def inference_turbo(self, t3_cond, text_tokens, temperature=0.8, top_k=1000, top_p=0.95, repetition_penalty=1.2,

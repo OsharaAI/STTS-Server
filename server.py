@@ -78,6 +78,8 @@ from routers import stt, conversation
 from routers.websocket import websocket_stt, websocket_conversation, websocket_conversation_v2
 from routers.stt import get_stt_engine
 from routers import multilingual_tts
+from routers import pcm_tts
+from routers import streaming_tts
 
 
 class OpenAISpeechRequest(BaseModel):
@@ -254,6 +256,8 @@ app.include_router(websocket_stt.router)
 app.include_router(websocket_conversation.router)
 app.include_router(websocket_conversation_v2.router)  # New modular conversation library
 app.include_router(multilingual_tts.router)  # Multilingual TTS
+app.include_router(pcm_tts.router)  # PCM TTS
+app.include_router(streaming_tts.router)  # Streaming TTS
 
 # --- Static Files and HTML Templates ---
 ui_static_path = Path(__file__).parent / "ui"
