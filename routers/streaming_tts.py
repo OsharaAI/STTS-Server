@@ -99,24 +99,45 @@ async def generate_stream(request: StreamingTTSRequest):
             language_id=request.language
         )
 
+        # Overlap-add crossfade to eliminate boundary artifacts between chunks.
+        # Each chunk from the model has fade-in/fade-out applied (see _process_token_buffer).
+        # We blend the overlapping fade regions to maintain smooth amplitude.
+        sample_rate = 24000  # Chatterbox default
+        crossfade_ms = 20  # must match fade_duration in _process_token_buffer (0.02s)
+        crossfade_samples = int(crossfade_ms / 1000.0 * sample_rate)
+        prev_tail = None  # holds the last crossfade_samples of the previous chunk
+
         for audio_chunk, metrics in stream:
             if audio_chunk is None:
                 continue
                 
             # audio_chunk is a torch Tensor (1, samples)
-            # Convert to numpy
             if isinstance(audio_chunk, torch.Tensor):
                 audio_np = audio_chunk.squeeze().cpu().numpy()
             else:
                 audio_np = audio_chunk
                 
-            # Convert to float32 bytes for transmission
-            # We transmit raw float32 bytes. Client must know Sr and Format.
-            # Usually Chatterbox is 24000Hz float32.
-            
-            # Ensure float32
             audio_np = audio_np.astype(np.float32)
-            yield audio_np.tobytes()
+
+            if prev_tail is not None and len(audio_np) > crossfade_samples and len(prev_tail) == crossfade_samples:
+                # Overlap-add: blend previous chunk's faded-out tail with this chunk's faded-in head
+                blended = prev_tail + audio_np[:crossfade_samples]
+                # Yield the blended region + body (excluding the tail we'll hold back)
+                body = audio_np[crossfade_samples:-crossfade_samples] if len(audio_np) > 2 * crossfade_samples else np.array([], dtype=np.float32)
+                yield np.concatenate([blended, body]).tobytes()
+                prev_tail = audio_np[-crossfade_samples:].copy()
+            else:
+                # First chunk or chunk too short for crossfade — hold back the tail
+                if len(audio_np) > crossfade_samples:
+                    yield audio_np[:-crossfade_samples].tobytes()
+                    prev_tail = audio_np[-crossfade_samples:].copy()
+                else:
+                    yield audio_np.tobytes()
+                    prev_tail = None
+
+        # Flush the held-back tail of the last chunk
+        if prev_tail is not None:
+            yield prev_tail.tobytes()
 
     return StreamingResponse(
         audio_chunk_generator(),
@@ -126,3 +147,37 @@ async def generate_stream(request: StreamingTTSRequest):
             "X-Encoding": "float32",
         }
     )
+
+
+class WarmupRequest(BaseModel):
+    """Request model for TTS warmup."""
+    voice_path: Optional[str] = Field(None, description="Path to voice file to pre-cache (uses default if not provided)")
+
+
+@router.post(
+    "/warmup",
+    summary="Warmup TTS Model",
+    description="Pre-cache voice conditioning and trigger T3 model compilation to eliminate first-request latency.",
+)
+async def warmup_tts(request: WarmupRequest = None):
+    """
+    Warmup the TTS model by pre-caching voice conditioning and running a dummy generation.
+    Call this after server startup to eliminate cold-start latency on first real request.
+    """
+    if not engine.MODEL_LOADED:
+        raise HTTPException(
+            status_code=503,
+            detail="TTS engine model is not currently loaded."
+        )
+
+    try:
+        voice_path = request.voice_path if request else None
+        engine.warmup_model(voice_path=voice_path)
+        return {
+            "status": "ok",
+            "warmed_up": engine.is_warmed_up(),
+            "message": "TTS model warmup complete. Voice conditioning cached and T3 compiled."
+        }
+    except Exception as e:
+        logger.error(f"Warmup failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Warmup failed: {str(e)}")

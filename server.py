@@ -173,6 +173,14 @@ async def lifespan(app: FastAPI):
             )
         else:
             logger.info("TTS Model loaded successfully.")
+            # Warmup: pre-cache voice conditioning and trigger T3 model compilation
+            # This eliminates the ~2-5s latency hit on the first TTS request
+            try:
+                logger.info("Running TTS model warmup (voice conditioning + T3 compilation)...")
+                engine.warmup_model()
+                logger.info("TTS model warmup complete.")
+            except Exception as e_warmup:
+                logger.warning(f"TTS warmup failed (non-fatal, first request will be slower): {e_warmup}")
         
         # Initialize and load STT engine
         app.state.stt_engine = STTEngine()
@@ -882,13 +890,24 @@ async def custom_tts_endpoint(
 
     try:
         # ### MODIFICATION START ###
-        # First, concatenate all raw chunks into a single audio clip.
-        final_audio_np = (
-            np.concatenate(all_audio_segments_np)
-            if len(all_audio_segments_np) > 1
-            else all_audio_segments_np[0]
-        )
-        perf_monitor.record("All audio chunks processed and concatenated")
+        # Concatenate all raw chunks with crossfade to avoid boundary artifacts.
+        if len(all_audio_segments_np) > 1:
+            crossfade_ms = 50  # 50ms crossfade between chunks
+            crossfade_samples = int(crossfade_ms / 1000.0 * engine_output_sample_rate) if engine_output_sample_rate else 0
+            final_audio_np = all_audio_segments_np[0]
+            for seg in all_audio_segments_np[1:]:
+                overlap = min(crossfade_samples, len(final_audio_np), len(seg))
+                if overlap > 0:
+                    fade_out = np.linspace(1.0, 0.0, overlap, dtype=final_audio_np.dtype)
+                    fade_in = np.linspace(0.0, 1.0, overlap, dtype=seg.dtype)
+                    # Blend the overlapping region
+                    blended = final_audio_np[-overlap:] * fade_out + seg[:overlap] * fade_in
+                    final_audio_np = np.concatenate([final_audio_np[:-overlap], blended, seg[overlap:]])
+                else:
+                    final_audio_np = np.concatenate([final_audio_np, seg])
+        else:
+            final_audio_np = all_audio_segments_np[0]
+        perf_monitor.record("All audio chunks processed and concatenated (crossfaded)")
 
         # Now, apply all audio processing to the COMPLETE audio clip.
         if config_manager.get_bool("audio_processing.enable_silence_trimming", False):

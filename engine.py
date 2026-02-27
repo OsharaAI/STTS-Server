@@ -3,6 +3,7 @@
 
 import logging
 import random
+import time
 import numpy as np
 import torch
 from typing import Any, Generator, Optional, Tuple
@@ -25,6 +26,11 @@ MODEL_LOADED: bool = False
 model_device: Optional[str] = (
     None  # Stores the resolved device string ('cuda' or 'cpu')
 )
+
+# Voice conditioning cache: avoids re-running prepare_conditionals for the same voice
+# Key: audio_prompt_path (str), Value: True (conds are on the model instance)
+_last_prepared_voice: Optional[str] = None
+_warmup_done: bool = False
 
 
 def set_seed(seed_value: int):
@@ -81,6 +87,124 @@ def _test_mps_functionality() -> bool:
     except Exception as e:
         logger.warning(f"MPS functionality test failed: {e}")
         return False
+
+
+def warmup_model(voice_path: Optional[str] = None) -> dict:
+    """
+    Warm up the TTS model to minimize first-request latency.
+    
+    Runs:
+    1. prepare_conditionals with the default/specified voice (caches voice embeddings)
+    2. A short dummy generation to trigger T3 model compilation + CUDA kernel caching
+    
+    Args:
+        voice_path: Path to voice file to pre-cache. If None, uses default voice.
+    
+    Returns:
+        dict with warmup timing info
+    """
+    global chatterbox_model, _last_prepared_voice, _warmup_done
+    
+    if not MODEL_LOADED or chatterbox_model is None:
+        logger.warning("Cannot warmup: model not loaded")
+        return {"status": "error", "message": "Model not loaded"}
+    
+    timings = {}
+    
+    # 1. Pre-cache voice conditioning
+    if voice_path is None:
+        # Find default voice
+        from config import get_predefined_voices_path
+        voices_dir = get_predefined_voices_path(ensure_absolute=True)
+        default_voices = list(voices_dir.glob("*.wav"))
+        if default_voices:
+            voice_path = str(default_voices[0])
+            logger.info(f"Warmup: Using default voice: {voice_path}")
+        else:
+            logger.warning("Warmup: No default voice files found, skipping conditioning warmup")
+    
+    if voice_path and hasattr(chatterbox_model, 'prepare_conditionals'):
+        t0 = time.time()
+        try:
+            chatterbox_model.prepare_conditionals(voice_path, exaggeration=0.5)
+            _last_prepared_voice = voice_path
+            timings["prepare_conditionals_ms"] = (time.time() - t0) * 1000
+            logger.info(f"Warmup: Voice conditioning cached in {timings['prepare_conditionals_ms']:.0f}ms")
+        except Exception as e:
+            logger.error(f"Warmup: prepare_conditionals failed: {e}")
+            timings["prepare_conditionals_error"] = str(e)
+    
+    # 2. Dummy generation to compile T3 model + warm CUDA kernels
+    t1 = time.time()
+    try:
+        # Detect if multilingual model (requires language_id)
+        import inspect
+        gen_kwargs = {"text": "Hello.", "temperature": 0.8}
+        if hasattr(chatterbox_model, 'generate_stream'):
+            sig = inspect.signature(chatterbox_model.generate_stream)
+            if 'language_id' in sig.parameters:
+                gen_kwargs["language_id"] = "en"
+            gen_kwargs["chunk_size"] = 25
+            # Use streaming to also warm the streaming path
+            for audio_chunk, metrics in chatterbox_model.generate_stream(**gen_kwargs):
+                pass  # Just run through to trigger compilation
+        else:
+            sig = inspect.signature(chatterbox_model.generate)
+            if 'language_id' in sig.parameters:
+                gen_kwargs["language_id"] = "en"
+            chatterbox_model.generate(**gen_kwargs)
+        timings["dummy_generation_ms"] = (time.time() - t1) * 1000
+        logger.info(f"Warmup: Dummy generation completed in {timings['dummy_generation_ms']:.0f}ms")
+    except Exception as e:
+        logger.error(f"Warmup: Dummy generation failed: {e}")
+        timings["dummy_generation_error"] = str(e)
+    
+    _warmup_done = True
+    timings["status"] = "ok"
+    total_ms = sum(v for k, v in timings.items() if k.endswith("_ms"))
+    timings["total_ms"] = total_ms
+    logger.info(f"Warmup: Complete in {total_ms:.0f}ms")
+    
+    return timings
+
+
+def ensure_voice_prepared(audio_prompt_path: Optional[str]) -> Optional[str]:
+    """
+    Ensure voice conditioning is prepared, using cache when possible.
+    
+    If the same voice was already prepared (cached on the model instance),
+    returns None to signal generate_stream should NOT pass audio_prompt_path
+    (so it reuses self.conds). Otherwise returns the path unchanged.
+    
+    Args:
+        audio_prompt_path: Voice file path to prepare
+        
+    Returns:
+        None if voice is already cached (generate_stream will reuse self.conds),
+        or the original path if new conditioning is needed.
+    """
+    global chatterbox_model, _last_prepared_voice
+    
+    if audio_prompt_path is None:
+        return None
+    
+    # Check if this voice is already the active conditioning
+    if (_last_prepared_voice is not None 
+        and _last_prepared_voice == audio_prompt_path 
+        and chatterbox_model is not None 
+        and chatterbox_model.conds is not None):
+        logger.info(f"Voice conditioning cache HIT: {Path(audio_prompt_path).name}")
+        return None  # Already prepared — tell caller to skip audio_prompt_path
+    
+    # New voice — will be prepared by generate_stream, update cache tracker
+    logger.info(f"Voice conditioning cache MISS: {Path(audio_prompt_path).name} (previous: {Path(_last_prepared_voice).name if _last_prepared_voice else 'None'})")
+    _last_prepared_voice = audio_prompt_path
+    return audio_prompt_path
+
+
+def is_warmed_up() -> bool:
+    """Check if warmup has been performed."""
+    return _warmup_done
 
 
 def load_model() -> bool:
@@ -275,8 +399,11 @@ def synthesize(
         if language_id is None:
             language_id = config_manager.get_string("generation_defaults.language", "en")
         
+        # Use voice conditioning cache to skip redundant prepare_conditionals
+        effective_audio_prompt = ensure_voice_prepared(audio_prompt_path)
+        
         logger.debug(
-            f"Synthesizing with params: audio_prompt='{audio_prompt_path}', temp={temperature}, "
+            f"Synthesizing with params: audio_prompt='{audio_prompt_path}' (effective='{effective_audio_prompt}'), temp={temperature}, "
             f"exag={exaggeration}, cfg_weight={cfg_weight}, language_id={language_id}, seed_applied_globally_if_nonzero={seed}"
         )
 
@@ -290,7 +417,7 @@ def synthesize(
             # Multilingual model - pass language_id
             wav_tensor = chatterbox_model.generate(
                 text=text,
-                audio_prompt_path=audio_prompt_path,
+                audio_prompt_path=effective_audio_prompt,
                 temperature=temperature,
                 exaggeration=exaggeration,
                 cfg_weight=cfg_weight,
@@ -305,7 +432,7 @@ def synthesize(
                 )
             wav_tensor = chatterbox_model.generate(
                 text=text,
-                audio_prompt_path=audio_prompt_path,
+                audio_prompt_path=effective_audio_prompt,
                 temperature=temperature,
                 exaggeration=exaggeration,
                 cfg_weight=cfg_weight,
@@ -352,6 +479,9 @@ def synthesize_stream(
         if language_id is None:
             language_id = config_manager.get_string("generation_defaults.language", "en")
 
+        # Use voice conditioning cache to skip redundant prepare_conditionals
+        effective_audio_prompt = ensure_voice_prepared(audio_prompt_path)
+
         # Check for language_id support
         import inspect
 
@@ -364,7 +494,7 @@ def synthesize_stream(
 
             kwargs = {
                 "text": text,
-                "audio_prompt_path": audio_prompt_path,
+                "audio_prompt_path": effective_audio_prompt,  # None if voice already cached
                 "temperature": temperature,
                 "exaggeration": exaggeration,
                 "cfg_weight": cfg_weight,
@@ -388,7 +518,7 @@ def synthesize_stream(
 
             kwargs = {
                 "text": text,
-                "audio_prompt_path": audio_prompt_path,
+                "audio_prompt_path": effective_audio_prompt,  # None if voice already cached
                 "temperature": temperature,
                 "exaggeration": exaggeration,
                 "cfg_weight": cfg_weight,

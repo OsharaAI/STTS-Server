@@ -332,14 +332,22 @@ class ChatterboxTTS:
             return None, 0.0, False
 
         fade_samples = int(fade_duration * self.sr)
-        if fade_samples > 0:
-            if fade_samples > len(audio_chunk):
-                fade_samples = len(audio_chunk)
-            fade_in = np.linspace(0.0, 1.0, fade_samples, dtype=audio_chunk.dtype)
-            audio_chunk[:fade_samples] *= fade_in
-
         audio_duration = len(audio_chunk) / self.sr
+        # Watermark BEFORE fade so the crossfade in the streaming endpoint
+        # blends both signal and watermark together (prevents doubled watermark
+        # artefacts at overlap-add boundaries).
         watermarked_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
+
+        if fade_samples > 0:
+            if fade_samples > len(watermarked_chunk):
+                fade_samples = len(watermarked_chunk)
+            # Fade-in at the start of the chunk
+            fade_in = np.linspace(0.0, 1.0, fade_samples, dtype=watermarked_chunk.dtype)
+            watermarked_chunk[:fade_samples] *= fade_in
+            # Fade-out at the end of the chunk to prevent abrupt cutoff / jitter
+            fade_out = np.linspace(1.0, 0.0, fade_samples, dtype=watermarked_chunk.dtype)
+            watermarked_chunk[-fade_samples:] *= fade_out
+
         audio_tensor = torch.from_numpy(watermarked_chunk).unsqueeze(0)
 
         if metrics.chunk_count == 0:
