@@ -983,6 +983,42 @@ async def custom_tts_endpoint(
     )
 
 
+@app.post(
+    "/tts/warmup",
+    tags=["TTS Generation"],
+    summary="Warm up the TTS model (voice conditioning + dummy generation)",
+)
+async def tts_warmup_endpoint(voice_filename: Optional[str] = Form(None)):
+    """
+    Triggers engine.warmup_model() to pre-cache voice conditioning and run
+    a short dummy generation to reduce first-request latency.
+
+    Optionally accepts a `voice_filename` (predefined voice filename) to
+    use for conditioning. If omitted, the engine will pick the default voice.
+    Returns the warmup timing/status dictionary from `engine.warmup_model()`.
+    """
+    logger.info("Request received for /tts/warmup")
+    voice_path = None
+    try:
+        if voice_filename:
+            voices_dir = get_predefined_voices_path(ensure_absolute=True)
+            potential = voices_dir / voice_filename
+            if not potential.is_file():
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Predefined voice file '{voice_filename}' not found.",
+                )
+            voice_path = str(potential)
+
+        result = engine.warmup_model(voice_path)
+        return JSONResponse(content=result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error during warmup endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # --- STT Generation Endpoint ---
 
 @app.post(
