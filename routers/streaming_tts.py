@@ -107,6 +107,13 @@ async def generate_stream(request: StreamingTTSRequest):
         crossfade_samples = int(crossfade_ms / 1000.0 * sample_rate)
         prev_tail = None  # holds the last crossfade_samples of the previous chunk
 
+        # Trailing silence detection: stop streaming if model generates
+        # consecutive silent chunks (hallucinated/garbage audio after speech ends)
+        silence_threshold = 0.01  # RMS below this = silence
+        consecutive_silent_chunks = 0
+        max_silent_chunks = 3  # stop after 3 consecutive silent chunks
+        has_produced_voiced = False  # track if any voiced audio was produced
+
         for audio_chunk, metrics in stream:
             if audio_chunk is None:
                 continue
@@ -118,6 +125,20 @@ async def generate_stream(request: StreamingTTSRequest):
                 audio_np = audio_chunk
                 
             audio_np = audio_np.astype(np.float32)
+
+            # Check if this chunk is mostly silence/noise
+            chunk_rms = np.sqrt(np.mean(audio_np ** 2)) if len(audio_np) > 0 else 0.0
+            if chunk_rms < silence_threshold:
+                consecutive_silent_chunks += 1
+                if has_produced_voiced and consecutive_silent_chunks >= max_silent_chunks:
+                    logger.info(
+                        f"Stopping stream: {consecutive_silent_chunks} consecutive silent chunks "
+                        f"detected after voiced audio (RMS={chunk_rms:.4f})"
+                    )
+                    break
+            else:
+                consecutive_silent_chunks = 0
+                has_produced_voiced = True
 
             if prev_tail is not None and len(audio_np) > crossfade_samples and len(prev_tail) == crossfade_samples:
                 # Overlap-add: blend previous chunk's faded-out tail with this chunk's faded-in head
@@ -135,8 +156,13 @@ async def generate_stream(request: StreamingTTSRequest):
                     yield audio_np.tobytes()
                     prev_tail = None
 
-        # Flush the held-back tail of the last chunk
+        # Flush the held-back tail of the last chunk with fade-out
         if prev_tail is not None:
+            # Apply a gentle fade-out to the final tail for clean ending
+            fade_samples = min(len(prev_tail), crossfade_samples)
+            if fade_samples > 0:
+                fade_out = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+                prev_tail[-fade_samples:] *= fade_out
             yield prev_tail.tobytes()
 
     return StreamingResponse(
