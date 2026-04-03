@@ -98,6 +98,72 @@ class STTEngine:
             self.model_loaded = False
             return False
 
+    @staticmethod
+    def _normalize_language(language: Optional[str]) -> Optional[str]:
+        """Normalize language value from request/config to Whisper-compatible value."""
+        if language is None:
+            return None
+
+        normalized = str(language).strip().lower()
+        if normalized in {"", "auto", "none", "null"}:
+            return None
+        return normalized
+
+    def transcribe_file_with_metadata(
+        self, audio_file_path: str, language: Optional[str] = None
+    ) -> Optional[dict]:
+        """
+        Transcribes audio from a file path and returns both text and effective language.
+
+        Args:
+            audio_file_path: Path to the audio file
+            language: Language code or None for auto-detection
+
+        Returns:
+            Dict with text/language metadata or None if transcription fails
+        """
+        if not self.model_loaded or self.model is None:
+            logger.error("STT model is not loaded. Cannot transcribe audio.")
+            return None
+
+        try:
+            audio_path = Path(audio_file_path)
+            if not audio_path.exists():
+                logger.error(f"Audio file not found: {audio_file_path}")
+                return None
+
+            configured_language = get_stt_language()
+            effective_language = self._normalize_language(language)
+            if effective_language is None:
+                effective_language = self._normalize_language(configured_language)
+
+            logger.info(
+                "Transcribing audio file: %s | language=%s",
+                audio_file_path,
+                effective_language if effective_language else "auto",
+            )
+
+            result = self.model.transcribe(str(audio_path), language=effective_language)
+            transcribed_text = str(result.get("text", "")).strip()
+            detected_language = result.get("language")
+            resolved_language = detected_language or effective_language or "auto"
+
+            logger.info(
+                "Transcription completed. Length: %d characters | resolved_language=%s",
+                len(transcribed_text),
+                resolved_language,
+            )
+            return {
+                "text": transcribed_text,
+                "language": resolved_language,
+                "detected_language": detected_language,
+                "requested_language": effective_language,
+            }
+
+        except Exception as e:
+            logger.error(f"Error during transcription: {e}", exc_info=True)
+            return None
+
     def transcribe_file(self, audio_file_path: str, language: Optional[str] = None) -> Optional[str]:
         """
         Transcribes audio from a file path.
@@ -109,30 +175,10 @@ class STTEngine:
         Returns:
             Transcribed text or None if transcription fails
         """
-        if not self.model_loaded or self.model is None:
-            logger.error("STT model is not loaded. Cannot transcribe audio.")
+        metadata = self.transcribe_file_with_metadata(audio_file_path, language)
+        if metadata is None:
             return None
-        
-        try:
-            audio_path = Path(audio_file_path)
-            if not audio_path.exists():
-                logger.error(f"Audio file not found: {audio_file_path}")
-                return None
-            
-            # Use configured language or auto-detection
-            detect_language = language or get_stt_language()
-            language_param = None if detect_language == "auto" else detect_language
-            
-            logger.info(f"Transcribing audio file: {audio_file_path}")
-            result = self.model.transcribe(str(audio_path), language=language_param)
-            
-            transcribed_text = result["text"].strip()
-            logger.info(f"Transcription completed. Length: {len(transcribed_text)} characters")
-            return transcribed_text
-            
-        except Exception as e:
-            logger.error(f"Error during transcription: {e}", exc_info=True)
-            return None
+        return metadata.get("text")
 
     def transcribe_numpy(self, audio_array: 'np.ndarray', language: Optional[str] = None) -> Optional[str]:
         """
@@ -160,9 +206,11 @@ class STTEngine:
                 logger.warning("Empty audio array provided")
                 return None
             
-            # Use configured language or auto-detection
-            detect_language = language or get_stt_language()
-            language_param = None if detect_language == "auto" else detect_language
+            # Use requested/configured language or auto-detection
+            detect_language = self._normalize_language(language)
+            if detect_language is None:
+                detect_language = self._normalize_language(get_stt_language())
+            language_param = detect_language
             
             logger.debug(f"Transcribing numpy array: shape={audio_array.shape}, dtype={audio_array.dtype}")
             result = self.model.transcribe(audio_array, language=language_param)
@@ -201,9 +249,11 @@ class STTEngine:
                 logger.warning("Empty audio array provided")
                 return None
             
-            # Use configured language or auto-detection
-            detect_language = language or get_stt_language()
-            language_param = None if detect_language == "auto" else detect_language
+            # Use requested/configured language or auto-detection
+            detect_language = self._normalize_language(language)
+            if detect_language is None:
+                detect_language = self._normalize_language(get_stt_language())
+            language_param = detect_language
             
             logger.debug(f"Transcribing numpy array with timing: shape={audio_array.shape}, dtype={audio_array.dtype}")
             raw_result = self.model.transcribe(audio_array, language=language_param)

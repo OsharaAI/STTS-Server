@@ -1318,6 +1318,7 @@ async def tts_warmup_endpoint(voice_filename: Optional[str] = Form(None)):
 async def speech_to_text_endpoint(
     audio_file: UploadFile = File(..., description="Audio file to transcribe (.wav, .mp3, .m4a, .flac)"),
     language: Optional[str] = Form(None, description="Language code or None for auto-detection"),
+    lang: Optional[str] = Form(None, description="Alias for language code"),
     stt_engine: STTEngine = Depends(get_stt_engine)
 ):
     """
@@ -1343,7 +1344,17 @@ async def speech_to_text_endpoint(
             detail=f"Unsupported audio format: {file_ext}. Supported: {', '.join(allowed_extensions)}"
         )
     
-    logger.info(f"Received STT request for file: {audio_file.filename}")
+    requested_language = language if language not in (None, "") else lang
+    normalized_language = None
+    if requested_language is not None:
+        candidate = str(requested_language).strip()
+        normalized_language = candidate if candidate else None
+
+    logger.info(
+        "Received STT request for file: %s | language=%s",
+        audio_file.filename,
+        normalized_language if normalized_language else "auto",
+    )
     
     # Save uploaded file temporarily
     temp_audio_path = get_output_path() / f"temp_stt_{uuid.uuid4().hex[:8]}{file_ext}"
@@ -1352,20 +1363,26 @@ async def speech_to_text_endpoint(
         with open(temp_audio_path, "wb") as buffer:
             shutil.copyfileobj(audio_file.file, buffer)
         
-        # Transcribe the audio
-        transcribed_text = stt_engine.transcribe_file(str(temp_audio_path), language)
-        
-        if transcribed_text is None:
+        # Transcribe the audio using effective language from payload/config.
+        transcription = stt_engine.transcribe_file_with_metadata(
+            str(temp_audio_path),
+            normalized_language,
+        )
+
+        if transcription is None:
             raise HTTPException(
                 status_code=500,
                 detail="Transcription failed. Please check audio file format and content."
             )
+
+        transcribed_text = str(transcription.get("text", "")).strip()
+        resolved_language = transcription.get("language") or normalized_language
         
         logger.info(f"STT transcription successful. Text length: {len(transcribed_text)} characters")
         
         return STTResponse(
             text=transcribed_text,
-            language=language,
+            language=resolved_language,
             duration=None  # Could add duration calculation if needed
         )
         
