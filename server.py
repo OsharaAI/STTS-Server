@@ -5,8 +5,11 @@
 
 import os
 import io
+import gc
+import inspect
 import logging
 import logging.handlers  # For RotatingFileHandler
+import re
 import shutil
 import time
 import uuid
@@ -81,6 +84,18 @@ from routers import multilingual_tts
 from routers import pcm_tts
 from routers import streaming_tts
 
+try:
+    from langdetect import detect
+    from langdetect.lang_detect_exception import LangDetectException
+except ImportError:
+    detect = None
+    LangDetectException = Exception
+
+try:
+    import nepali_num2word  # type: ignore
+except ImportError:
+    nepali_num2word = None
+
 
 class OpenAISpeechRequest(BaseModel):
     model: str
@@ -118,6 +133,178 @@ logger = logging.getLogger(__name__)
 
 # --- Global Variables & Application Setup ---
 startup_complete_event = threading.Event()  # For coordinating browser opening
+
+_DEVANAGARI_TO_ASCII_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
+_NEPALI_DIGIT_PATTERN = re.compile(r"[0-9०-९]+")
+
+
+def _resolve_nepali_num2word_fn():
+    """Resolve a callable from nepali-num2word across possible API names."""
+    if nepali_num2word is None:
+        return None
+
+    candidates = [
+        "num2word",
+        "num_to_word",
+        "number_to_word",
+        "convert_num_to_word",
+        "convert_number_to_word",
+        "convert_to_words",
+        "convert",
+    ]
+    for name in candidates:
+        fn = getattr(nepali_num2word, name, None)
+        if callable(fn):
+            return fn
+    return None
+
+
+_NEPALI_NUM2WORD_FN = _resolve_nepali_num2word_fn()
+_NEPALI_NUM2WORD_SUPPORTS_LANG = False
+if _NEPALI_NUM2WORD_FN is not None:
+    try:
+        _NEPALI_NUM2WORD_SUPPORTS_LANG = "lang" in inspect.signature(_NEPALI_NUM2WORD_FN).parameters
+    except Exception:
+        _NEPALI_NUM2WORD_SUPPORTS_LANG = False
+
+
+def _should_apply_nepali_num2word(text: str, language_id: Optional[str]) -> bool:
+    """Enable Nepali number normalization for explicit or detected Nepali text."""
+    lang = (language_id or "").strip().lower()
+    if lang in {"ne", "nepali"}:
+        return True
+
+    if detect is None or not text or not text.strip():
+        return False
+
+    try:
+        return detect(text) == "ne"
+    except LangDetectException:
+        return False
+    except Exception:
+        return False
+
+
+def _convert_nepali_numbers_to_words(text: str) -> str:
+    """Convert ASCII/Devanagari integer tokens to Nepali words when possible."""
+    if not text or _NEPALI_NUM2WORD_FN is None:
+        return text
+
+    def _replace(match: re.Match) -> str:
+        token = match.group(0)
+        ascii_token = token.translate(_DEVANAGARI_TO_ASCII_DIGITS)
+        if not ascii_token.isdigit():
+            return token
+
+        try:
+            # Try int first (common API), then fallback to raw string.
+            if _NEPALI_NUM2WORD_SUPPORTS_LANG:
+                converted = _NEPALI_NUM2WORD_FN(int(ascii_token), lang="np")
+            else:
+                converted = _NEPALI_NUM2WORD_FN(int(ascii_token))
+        except Exception:
+            try:
+                if _NEPALI_NUM2WORD_SUPPORTS_LANG:
+                    converted = _NEPALI_NUM2WORD_FN(ascii_token, lang="np")
+                else:
+                    converted = _NEPALI_NUM2WORD_FN(ascii_token)
+            except Exception:
+                return token
+
+        return str(converted) if converted is not None else token
+
+    return _NEPALI_DIGIT_PATTERN.sub(_replace, text)
+
+
+def _log_num2word_conversion(endpoint_name: str, original_text: str, normalized_text: str) -> None:
+    """Log original and normalized text when Nepali num2word changes input."""
+    if normalized_text == original_text:
+        return
+
+    before_preview = original_text[:250].replace("\n", " ")
+    after_preview = normalized_text[:250].replace("\n", " ")
+    logger.info(f"[{endpoint_name}] Nepali num2word applied")
+    logger.info(f"[{endpoint_name}] text_before: {before_preview}{'...' if len(original_text) > 250 else ''}")
+    logger.info(f"[{endpoint_name}] text_after: {after_preview}{'...' if len(normalized_text) > 250 else ''}")
+
+
+def _clear_cuda_memory_after_generate() -> None:
+    """Release cached CUDA memory after /generate requests to reduce OOM risk."""
+    gc.collect()
+    if not torch.cuda.is_available():
+        return
+
+    try:
+        torch.cuda.empty_cache()
+        if hasattr(torch.cuda, "ipc_collect"):
+            torch.cuda.ipc_collect()
+        logger.debug("CUDA cache cleared after /generate request")
+    except Exception as e:
+        logger.warning(f"Failed to clear CUDA cache after /generate: {e}")
+
+
+def _split_chunk_for_retry(chunk: str, min_chunk_size: int = 50) -> List[str]:
+    """Split an oversized/failed chunk into smaller pieces for retry."""
+    if not chunk or not chunk.strip():
+        return []
+
+    target = max(min_chunk_size, min(220, max(min_chunk_size, len(chunk) // 2)))
+    sub_chunks = utils.chunk_text_by_sentences(chunk, target)
+
+    # Fallback for very long single-sentence text where sentence splitter cannot split.
+    if len(sub_chunks) <= 1 and len(chunk) > target:
+        words = chunk.split()
+        if len(words) > 1:
+            mid = len(words) // 2
+            left = " ".join(words[:mid]).strip()
+            right = " ".join(words[mid:]).strip()
+            sub_chunks = [c for c in [left, right] if c]
+
+    # Safety: avoid returning the same unsplittable chunk.
+    if len(sub_chunks) == 1 and sub_chunks[0].strip() == chunk.strip():
+        return []
+
+    return [c for c in sub_chunks if c and c.strip()]
+
+
+def _enforce_max_chunk_size(chunks: List[str], max_chars: int) -> List[str]:
+    """Hard-wrap oversized chunks so each synthesis call stays within safe length."""
+    if max_chars <= 0:
+        return [c for c in chunks if c and c.strip()]
+
+    out: List[str] = []
+    for chunk in chunks:
+        if not chunk or not chunk.strip():
+            continue
+        if len(chunk) <= max_chars:
+            out.append(chunk.strip())
+            continue
+
+        # Prefer word-boundary splitting for natural prosody.
+        words = chunk.split()
+        if len(words) > 1:
+            current: List[str] = []
+            current_len = 0
+            for w in words:
+                w_len = len(w)
+                proposed = current_len + (1 if current else 0) + w_len
+                if current and proposed > max_chars:
+                    out.append(" ".join(current))
+                    current = [w]
+                    current_len = w_len
+                else:
+                    current.append(w)
+                    current_len = proposed
+            if current:
+                out.append(" ".join(current))
+            continue
+
+        # Fallback for scripts/inputs without spaces.
+        text = chunk.strip()
+        for i in range(0, len(text), max_chars):
+            out.append(text[i:i + max_chars])
+
+    return [c for c in out if c and c.strip()]
 
 
 # --- Dependency Functions ---
@@ -192,29 +379,39 @@ async def lifespan(app: FastAPI):
         else:
             logger.info("STT Model loaded successfully.")
         
-        # Initialize and load Multilingual TTS model
-        logger.info("Attempting to load Multilingual TTS model...")
+        # Initialize multilingual TTS endpoint model.
+        # Prefer reusing engine's already-loaded model to avoid duplicating large GPU allocations.
+        logger.info("Initializing multilingual TTS endpoint model...")
+        app.state.multilingual_tts_model = None
         try:
-            logger.info("Importing ChatterboxMultilingualTTS from chatterbox.mtl_tts...")
-            from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-            logger.info("Import successful. Loading Chatterbox Multilingual TTS model...")
-            
-            # Determine device
-            if torch.cuda.is_available():
-                mtl_device = "cuda"
-            elif torch.backends.mps.is_available():
-                mtl_device = "mps"
-            else:
-                mtl_device = "cpu"
-            
-            logger.info(f"Initializing multilingual TTS model on device: {mtl_device}")
-            app.state.multilingual_tts_model = ChatterboxMultilingualTTS.from_pretrained(device=mtl_device)
-            logger.info(f"Multilingual TTS model loaded successfully on {mtl_device}")
+            if engine.MODEL_LOADED and engine.chatterbox_model is not None:
+                generate_sig = inspect.signature(engine.chatterbox_model.generate)
+                if "language_id" in generate_sig.parameters:
+                    app.state.multilingual_tts_model = engine.chatterbox_model
+                    logger.info("Reusing engine multilingual model for /multilingual-tts endpoints (no duplicate GPU model load).")
+                else:
+                    logger.info("Engine model is standard TTS; multilingual endpoint model will be loaded separately.")
+
+            if app.state.multilingual_tts_model is None:
+                logger.info("Importing ChatterboxMultilingualTTS from chatterbox.mtl_tts...")
+                from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+                logger.info("Import successful. Loading dedicated Chatterbox Multilingual TTS model...")
+
+                if torch.cuda.is_available():
+                    mtl_device = "cuda"
+                elif torch.backends.mps.is_available():
+                    mtl_device = "mps"
+                else:
+                    mtl_device = "cpu"
+
+                logger.info(f"Initializing multilingual TTS model on device: {mtl_device}")
+                app.state.multilingual_tts_model = ChatterboxMultilingualTTS.from_pretrained(device=mtl_device)
+                logger.info(f"Multilingual TTS model loaded successfully on {mtl_device}")
         except ImportError as ie:
             logger.warning(f"Failed to import Multilingual TTS module: {ie}. Multilingual TTS endpoints will not work.")
             app.state.multilingual_tts_model = None
         except Exception as e:
-            logger.warning(f"Failed to load Multilingual TTS model: {e}. Multilingual TTS endpoints will not work.", exc_info=True)
+            logger.warning(f"Failed to initialize multilingual TTS model: {e}. Multilingual TTS endpoints will not work.", exc_info=True)
             app.state.multilingual_tts_model = None
         
         if tts_loaded:  # Only open browser if TTS (primary functionality) is working
@@ -246,6 +443,7 @@ app = FastAPI(
     description="Text-to-Speech server with advanced UI and API capabilities.",
     version="2.0.2",  # Version Bump
     lifespan=lifespan,
+    root_path="/tts",
 )
 
 # --- CORS Middleware ---
@@ -256,6 +454,16 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def clear_cuda_cache_for_generate_requests(request: Request, call_next):
+    """Ensure CUDA cache is released after each /generate request."""
+    try:
+        return await call_next(request)
+    finally:
+        if request.method == "POST" and request.url.path.endswith("/generate"):
+            _clear_cuda_memory_after_generate()
 
 # --- Include Routers ---
 app.include_router(stt.router)
@@ -701,7 +909,22 @@ async def upload_predefined_voice_endpoint(files: List[UploadFile] = File(...)):
     },
 )
 async def custom_tts_endpoint(
-    request: CustomTTSRequest, background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    text: str = Form(..., description="Text to synthesize"),
+    voice_mode: Literal["predefined", "clone"] = Form("predefined"),
+    predefined_voice_id: Optional[str] = Form(None),
+    reference_audio_file: Optional[UploadFile] = File(None),
+    reference_audio_url: Optional[str] = Form(None),
+    output_format: str = Form("wav"),
+    split_text: bool = Form(True),
+    chunk_size: int = Form(120),
+    temperature: Optional[float] = Form(None),
+    exaggeration: Optional[float] = Form(None),
+    cfg_weight: Optional[float] = Form(None),
+    seed: Optional[int] = Form(None),
+    speed_factor: Optional[float] = Form(None),
+    language: Optional[str] = Form(None),
+    language_id: Optional[str] = Form(None),
 ):
     """
     Generates speech audio from text using specified parameters.
@@ -721,57 +944,74 @@ async def custom_tts_endpoint(
         )
 
     logger.info(
-        f"Received /tts request: mode='{request.voice_mode}', format='{request.output_format}'"
+        f"Received /generate request: mode='{voice_mode}', format='{output_format}'"
     )
     logger.debug(
-        f"TTS params: seed={request.seed}, split={request.split_text}, chunk_size={request.chunk_size}"
+        f"TTS params: seed={seed}, split={split_text}, chunk_size={chunk_size}"
     )
-    logger.debug(f"Input text (first 100 chars): '{request.text[:100]}...'")
+    logger.debug(f"Input text (first 100 chars): '{text[:100]}...'")
+
+    lang_for_num2word = language_id if language_id is not None else language
+    if _should_apply_nepali_num2word(text, lang_for_num2word):
+        if _NEPALI_NUM2WORD_FN is None:
+            logger.warning("Nepali language detected but nepali-num2word is not installed; skipping number normalization")
+        else:
+            normalized_text = _convert_nepali_numbers_to_words(text)
+            _log_num2word_conversion("/tts", text, normalized_text)
+            text = normalized_text
 
     audio_prompt_path_for_engine: Optional[Path] = None
-    if request.voice_mode == "predefined":
-        if not request.predefined_voice_id:
+    if voice_mode == "predefined":
+        if not predefined_voice_id:
             raise HTTPException(
                 status_code=400,
                 detail="Missing 'predefined_voice_id' for 'predefined' voice mode.",
             )
         voices_dir = get_predefined_voices_path(ensure_absolute=True)
-        potential_path = voices_dir / request.predefined_voice_id
+        potential_path = voices_dir / predefined_voice_id
         if not potential_path.is_file():
             logger.error(f"Predefined voice file not found: {potential_path}")
             raise HTTPException(
                 status_code=404,
-                detail=f"Predefined voice file '{request.predefined_voice_id}' not found.",
+                detail=f"Predefined voice file '{predefined_voice_id}' not found.",
             )
         audio_prompt_path_for_engine = potential_path
-        logger.info(f"Using predefined voice: {request.predefined_voice_id}")
+        logger.info(f"Using predefined voice: {predefined_voice_id}")
 
-    elif request.voice_mode == "clone":
-        if not request.reference_audio_filename:
+    elif voice_mode == "clone":
+        if reference_audio_file is not None and reference_audio_file.filename:
+            import tempfile
+            suffix = Path(reference_audio_file.filename).suffix or ".wav"
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            try:
+                content = reference_audio_file.file.read()
+                temp_file.write(content)
+                temp_file.close()
+                audio_prompt_path_for_engine = Path(temp_file.name)
+                background_tasks.add_task(lambda p: p.unlink(missing_ok=True), audio_prompt_path_for_engine)
+                logger.info("Using uploaded reference audio file for cloning")
+            except Exception as e:
+                logger.error(f"Error reading uploaded file: {e}")
+                raise HTTPException(status_code=400, detail="Error processing uploaded reference file")
+        elif reference_audio_url:
+            downloaded = utils.download_audio_from_url(reference_audio_url)
+            if not downloaded:
+                raise HTTPException(status_code=400, detail="Error downloading reference audio URL")
+            audio_prompt_path_for_engine = downloaded
+            background_tasks.add_task(lambda p: p.unlink(missing_ok=True), audio_prompt_path_for_engine)
+            logger.info("Using given S3/HTTP URL for cloning")
+        else:
             raise HTTPException(
                 status_code=400,
-                detail="Missing 'reference_audio_filename' for 'clone' voice mode.",
+                detail="Missing 'reference_audio_file' or 'reference_audio_url' for 'clone' voice mode.",
             )
-        ref_dir = get_reference_audio_path(ensure_absolute=True)
-        potential_path = ref_dir / request.reference_audio_filename
-        if not potential_path.is_file():
-            logger.error(
-                f"Reference audio file for cloning not found: {potential_path}"
-            )
-            raise HTTPException(
-                status_code=404,
-                detail=f"Reference audio file '{request.reference_audio_filename}' not found.",
-            )
+            
         max_dur = config_manager.get_int("audio_output.max_reference_duration_sec", 30)
-        is_valid, msg = utils.validate_reference_audio(potential_path, max_dur)
+        is_valid, msg = utils.validate_reference_audio(audio_prompt_path_for_engine, max_dur)
         if not is_valid:
             raise HTTPException(
                 status_code=400, detail=f"Invalid reference audio: {msg}"
             )
-        audio_prompt_path_for_engine = potential_path
-        logger.info(
-            f"Using reference audio for cloning: {request.reference_audio_filename}"
-        )
 
     perf_monitor.record("Parameters and voice path resolved")
 
@@ -783,28 +1023,47 @@ async def custom_tts_endpoint(
         None  # SR from the TTS engine (e.g., 24000 Hz)
     )
 
-    if request.split_text and len(request.text) > (
-        request.chunk_size * 1.5 if request.chunk_size else 120 * 1.5
-    ):
-        chunk_size_to_use = (
-            request.chunk_size if request.chunk_size is not None else 120
-        )
+    chunk_size_to_use = chunk_size if chunk_size is not None else 120
+    should_split = split_text or len(text) > (chunk_size_to_use * 1.5)
+    if should_split:
         logger.info(f"Splitting text into chunks of size ~{chunk_size_to_use}.")
-        text_chunks = utils.chunk_text_by_sentences(request.text, chunk_size_to_use)
+        text_chunks = utils.chunk_text_by_sentences(text, chunk_size_to_use)
+        text_chunks = _enforce_max_chunk_size(text_chunks, chunk_size_to_use)
         perf_monitor.record(f"Text split into {len(text_chunks)} chunks")
     else:
-        text_chunks = [request.text]
+        text_chunks = [text]
         logger.info(
             "Processing text as a single chunk (splitting not enabled or text too short)."
         )
+        text_chunks = _enforce_max_chunk_size(text_chunks, chunk_size_to_use)
 
     if not text_chunks:
         raise HTTPException(
             status_code=400, detail="Text processing resulted in no usable chunks."
         )
 
-    for i, chunk in enumerate(text_chunks):
-        logger.info(f"Synthesizing chunk {i+1}/{len(text_chunks)}...")
+    pending_chunks = list(text_chunks)
+    completed_chunks = 0
+    cfg_weight_to_use = (
+        cfg_weight
+        if cfg_weight is not None
+        else get_gen_default_cfg_weight()
+    )
+    speed_factor_to_use = (
+        speed_factor
+        if speed_factor is not None
+        else get_gen_default_speed_factor()
+    )
+
+    while pending_chunks:
+        chunk = pending_chunks.pop(0)
+        completed_chunks += 1
+        logger.info(f"Synthesizing chunk {completed_chunks}/{len(text_chunks) + len(pending_chunks)}...")
+
+        chunk_audio_tensor = None
+        chunk_sr_from_engine = None
+        current_processed_audio_tensor = None
+
         try:
             chunk_audio_tensor, chunk_sr_from_engine = engine.synthesize(
                 text=chunk,
@@ -814,29 +1073,36 @@ async def custom_tts_endpoint(
                     else None
                 ),
                 temperature=(
-                    request.temperature
-                    if request.temperature is not None
+                    temperature
+                    if temperature is not None
                     else get_gen_default_temperature()
                 ),
                 exaggeration=(
-                    request.exaggeration
-                    if request.exaggeration is not None
+                    exaggeration
+                    if exaggeration is not None
                     else get_gen_default_exaggeration()
                 ),
                 cfg_weight=(
-                    request.cfg_weight
-                    if request.cfg_weight is not None
-                    else get_gen_default_cfg_weight()
+                    cfg_weight_to_use
                 ),
                 seed=(
-                    request.seed if request.seed is not None else get_gen_default_seed()
+                    seed if seed is not None else get_gen_default_seed()
                 ),
-                language_id=request.language_id,
+                language_id=language_id,
             )
-            perf_monitor.record(f"Engine synthesized chunk {i+1}")
+            perf_monitor.record(f"Engine synthesized chunk {completed_chunks}")
 
             if chunk_audio_tensor is None or chunk_sr_from_engine is None:
-                error_detail = f"TTS engine failed to synthesize audio for chunk {i+1}."
+                sub_chunks = _split_chunk_for_retry(chunk, min_chunk_size=50)
+                if sub_chunks:
+                    logger.warning(
+                        f"Chunk synthesis failed; splitting into {len(sub_chunks)} smaller chunks and retrying."
+                    )
+                    pending_chunks = sub_chunks + pending_chunks
+                    completed_chunks -= 1
+                    continue
+
+                error_detail = f"TTS engine failed to synthesize audio for chunk {completed_chunks}."
                 logger.error(error_detail)
                 raise HTTPException(status_code=500, detail=error_detail)
 
@@ -844,37 +1110,45 @@ async def custom_tts_endpoint(
                 engine_output_sample_rate = chunk_sr_from_engine
             elif engine_output_sample_rate != chunk_sr_from_engine:
                 logger.warning(
-                    f"Inconsistent sample rate from engine: chunk {i+1} ({chunk_sr_from_engine}Hz) "
+                    f"Inconsistent sample rate from engine: chunk {completed_chunks} ({chunk_sr_from_engine}Hz) "
                     f"differs from previous ({engine_output_sample_rate}Hz). Using first chunk's SR."
                 )
 
             current_processed_audio_tensor = chunk_audio_tensor
 
-            speed_factor_to_use = (
-                request.speed_factor
-                if request.speed_factor is not None
-                else get_gen_default_speed_factor()
-            )
             if speed_factor_to_use != 1.0:
                 current_processed_audio_tensor, _ = utils.apply_speed_factor(
                     current_processed_audio_tensor,
                     chunk_sr_from_engine,
                     speed_factor_to_use,
                 )
-                perf_monitor.record(f"Speed factor applied to chunk {i+1}")
+                perf_monitor.record(f"Speed factor applied to chunk {completed_chunks}")
 
-            # ### MODIFICATION ###
-            # All other processing is REMOVED from the loop.
-            # We will process the final concatenated audio clip.
             processed_audio_np = current_processed_audio_tensor.cpu().numpy().squeeze()
             all_audio_segments_np.append(processed_audio_np)
 
         except HTTPException as http_exc:
             raise http_exc
         except Exception as e_chunk:
-            error_detail = f"Error processing audio chunk {i+1}: {str(e_chunk)}"
+            error_detail = f"Error processing audio chunk {completed_chunks}: {str(e_chunk)}"
             logger.error(error_detail, exc_info=True)
+
+            sub_chunks = _split_chunk_for_retry(chunk, min_chunk_size=50)
+            if sub_chunks:
+                logger.warning(
+                    f"Chunk raised exception; splitting into {len(sub_chunks)} smaller chunks for retry."
+                )
+                pending_chunks = sub_chunks + pending_chunks
+                completed_chunks -= 1
+                continue
+
             raise HTTPException(status_code=500, detail=error_detail)
+        finally:
+            if chunk_audio_tensor is not None:
+                del chunk_audio_tensor
+            if current_processed_audio_tensor is not None:
+                del current_processed_audio_tensor
+            _clear_cuda_memory_after_generate()
 
     if not all_audio_segments_np:
         logger.error("No audio segments were successfully generated.")
@@ -943,7 +1217,7 @@ async def custom_tts_endpoint(
         )
 
     output_format_str = (
-        request.output_format if request.output_format else get_audio_output_format()
+        output_format if output_format else get_audio_output_format()
     )
 
     encoded_audio_bytes = utils.encode_audio(
@@ -1127,11 +1401,14 @@ async def speech_to_text_endpoint(
     },
 )
 async def generate_speech_endpoint(
+    background_tasks: BackgroundTasks,
     text: str = Form(..., description="Text to convert to speech"),
     reference_audio: Optional[UploadFile] = File(None, description="Optional reference audio file for voice cloning"),
     exaggeration: float = Form(0.5, description="Voice exaggeration level (0.25-2.0)"),
     temperature: float = Form(0.8, description="Sampling temperature (0.05-5.0)"),
+    cfg_weight: Optional[float] = Form(None, description="Classifier-free guidance weight (0.2-1.0)"),
     seed: int = Form(0, description="Random seed (0 for random)"),
+    speed_factor: Optional[float] = Form(None, description="Global speech speed factor (0.25-4.0)"),
     diffusion_steps: int = Form(10, description="Number of diffusion steps (1-15)"),
     min_p: float = Form(0.05, description="Minimum probability sampler (0.0-1.0)"),
     top_p: float = Form(1.0, description="Top-p/nucleus sampling (0.0-1.0)"),
@@ -1152,6 +1429,14 @@ async def generate_speech_endpoint(
         )
     
     logger.info(f"Received /generate request with text: '{text[:50]}...', reference_audio: '{reference_audio.filename if reference_audio else 'None'}', language_id: {language_id}")
+
+    if _should_apply_nepali_num2word(text, language_id):
+        if _NEPALI_NUM2WORD_FN is None:
+            logger.warning("Nepali language detected but nepali-num2word is not installed; skipping number normalization")
+        else:
+            normalized_text = _convert_nepali_numbers_to_words(text)
+            _log_num2word_conversion("/generate", text, normalized_text)
+            text = normalized_text
     
     # Handle reference audio if provided
     audio_prompt_path: Optional[Path] = None
@@ -1178,6 +1463,7 @@ async def generate_speech_endpoint(
             max_dur = config_manager.get_int("audio_output.max_reference_duration_sec", 30)
 
             audio_prompt_path = temp_ref_audio_path
+            background_tasks.add_task(lambda p: p.unlink(missing_ok=True), temp_ref_audio_path)
             logger.info(f"Using uploaded reference audio: {reference_audio.filename}")
 
         except HTTPException:
@@ -1195,53 +1481,132 @@ async def generate_speech_endpoint(
     engine_output_sample_rate: Optional[int] = None
     
     # Handle text chunking
-    if split_text and len(text) > (chunk_size * 1.5):
+    should_split = split_text or len(text) > (chunk_size * 1.5)
+    if should_split:
         logger.info(f"Splitting text into chunks of size ~{chunk_size}.")
         text_chunks = utils.chunk_text_by_sentences(text, chunk_size)
+        text_chunks = _enforce_max_chunk_size(text_chunks, chunk_size)
     else:
         text_chunks = [text]
-        logger.info("Processing text as a single chunk (splitting not enabled or text too short).")
+        logger.info("Processing text as a single chunk (splitting not enabled and text short).")
+        text_chunks = _enforce_max_chunk_size(text_chunks, chunk_size)
     
     if not text_chunks:
         raise HTTPException(status_code=400, detail="Text processing resulted in no usable chunks.")
     
-    # Process each chunk
-    for i, chunk in enumerate(text_chunks):
-        logger.info(f"Synthesizing chunk {i+1}/{len(text_chunks)}...")
-        try:
-            chunk_audio_tensor, chunk_sr_from_engine = engine.synthesize(
-                text=chunk,
-                audio_prompt_path=str(audio_prompt_path) if audio_prompt_path else None,
-                temperature=temperature,
-                exaggeration=exaggeration,
-                cfg_weight=get_gen_default_cfg_weight(),
-                seed=seed,
-                language_id=language_id,
-            )
-            
-            if chunk_audio_tensor is None or chunk_sr_from_engine is None:
-                error_detail = f"TTS engine failed to synthesize audio for chunk {i+1}."
-                logger.error(error_detail)
-                raise HTTPException(status_code=500, detail=error_detail)
-            
-            if engine_output_sample_rate is None:
-                engine_output_sample_rate = chunk_sr_from_engine
-            elif engine_output_sample_rate != chunk_sr_from_engine:
-                logger.warning(
-                    f"Inconsistent sample rate from engine: chunk {i+1} ({chunk_sr_from_engine}Hz) "
-                    f"differs from previous ({engine_output_sample_rate}Hz). Using first chunk's SR."
+    # Process each chunk with adaptive split-and-retry for OOM resilience
+    pending_chunks = list(text_chunks)
+    completed_chunks = 0
+    max_adaptive_splits = 4
+    cfg_weight_to_use = (
+        cfg_weight
+        if cfg_weight is not None
+        else get_gen_default_cfg_weight()
+    )
+    speed_factor_to_use = (
+        speed_factor
+        if speed_factor is not None
+        else get_gen_default_speed_factor()
+    )
+
+    while pending_chunks:
+        chunk = pending_chunks.pop(0)
+        completed_chunks += 1
+        logger.info(f"Synthesizing chunk {completed_chunks}/{len(text_chunks) + len(pending_chunks)}...")
+
+        # Track adaptive splitting depth to avoid infinite retries on pathological input
+        split_attempts = 0
+
+        while True:
+            chunk_audio_tensor = None
+            chunk_sr_from_engine = None
+            current_processed_audio_tensor = None
+
+            if split_attempts > max_adaptive_splits:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Text chunk is too complex/long to synthesize without OOM. Please reduce chunk_size or split text manually."
                 )
-            
-            # Convert to numpy and collect
-            processed_audio_np = chunk_audio_tensor.cpu().numpy().squeeze()
-            all_audio_segments_np.append(processed_audio_np)
-            
-        except HTTPException as http_exc:
-            raise http_exc
-        except Exception as e_chunk:
-            error_detail = f"Error processing audio chunk {i+1}: {str(e_chunk)}"
-            logger.error(error_detail, exc_info=True)
-            raise HTTPException(status_code=500, detail=error_detail)
+
+            if split_attempts > 0:
+                logger.warning(
+                    f"Retrying chunk with smaller split (attempt {split_attempts}/{max_adaptive_splits})."
+                )
+
+            logger.debug(f"Chunk length: {len(chunk)} chars")
+
+            try:
+                chunk_audio_tensor, chunk_sr_from_engine = engine.synthesize(
+                    text=chunk,
+                    audio_prompt_path=str(audio_prompt_path) if audio_prompt_path else None,
+                    temperature=temperature,
+                    exaggeration=exaggeration,
+                    cfg_weight=cfg_weight_to_use,
+                    seed=seed,
+                    language_id=language_id,
+                )
+
+                if chunk_audio_tensor is None or chunk_sr_from_engine is None:
+                    # Likely synthesis failure (including possible CUDA OOM in engine layer).
+                    sub_chunks = _split_chunk_for_retry(chunk, min_chunk_size=50)
+                    if sub_chunks:
+                        logger.warning(
+                            f"Chunk synthesis failed; splitting into {len(sub_chunks)} smaller chunks and retrying."
+                        )
+                        pending_chunks = sub_chunks + pending_chunks
+                        completed_chunks -= 1
+                        break
+
+                    error_detail = f"TTS engine failed to synthesize audio for chunk {completed_chunks}."
+                    logger.error(error_detail)
+                    raise HTTPException(status_code=500, detail=error_detail)
+
+                if engine_output_sample_rate is None:
+                    engine_output_sample_rate = chunk_sr_from_engine
+                elif engine_output_sample_rate != chunk_sr_from_engine:
+                    logger.warning(
+                        f"Inconsistent sample rate from engine: chunk {completed_chunks} ({chunk_sr_from_engine}Hz) "
+                        f"differs from previous ({engine_output_sample_rate}Hz). Using first chunk's SR."
+                    )
+
+                current_processed_audio_tensor = chunk_audio_tensor
+                if speed_factor_to_use != 1.0:
+                    current_processed_audio_tensor, _ = utils.apply_speed_factor(
+                        current_processed_audio_tensor,
+                        chunk_sr_from_engine,
+                        speed_factor_to_use,
+                    )
+
+                # Convert to numpy and collect
+                processed_audio_np = current_processed_audio_tensor.cpu().numpy().squeeze()
+                all_audio_segments_np.append(processed_audio_np)
+                break
+
+            except HTTPException as http_exc:
+                raise http_exc
+            except Exception as e_chunk:
+                error_detail = f"Error processing audio chunk {completed_chunks}: {str(e_chunk)}"
+                logger.error(error_detail, exc_info=True)
+
+                # Attempt adaptive split retry before hard-failing.
+                sub_chunks = _split_chunk_for_retry(chunk, min_chunk_size=50)
+                if sub_chunks:
+                    split_attempts += 1
+                    logger.warning(
+                        f"Chunk raised exception; splitting into {len(sub_chunks)} smaller chunks for retry."
+                    )
+                    pending_chunks = sub_chunks + pending_chunks
+                    completed_chunks -= 1
+                    break
+
+                raise HTTPException(status_code=500, detail=error_detail)
+            finally:
+                # Free per-chunk intermediates aggressively to reduce VRAM growth on long texts.
+                if chunk_audio_tensor is not None:
+                    del chunk_audio_tensor
+                if current_processed_audio_tensor is not None:
+                    del current_processed_audio_tensor
+                _clear_cuda_memory_after_generate()
     
     if not all_audio_segments_np:
         logger.error("No audio segments were successfully generated.")
@@ -1252,13 +1617,23 @@ async def generate_speech_endpoint(
         raise HTTPException(status_code=500, detail="Failed to determine engine sample rate.")
     
     try:
-        # Concatenate all chunks into final audio
-        final_audio_np = (
-            np.concatenate(all_audio_segments_np)
-            if len(all_audio_segments_np) > 1
-            else all_audio_segments_np[0]
-        )
-        logger.info(f"All {len(all_audio_segments_np)} audio chunks processed and concatenated")
+        # Concatenate buffered chunk audio into one final clip before sending.
+        if len(all_audio_segments_np) > 1:
+            crossfade_ms = 35
+            crossfade_samples = int(crossfade_ms / 1000.0 * engine_output_sample_rate) if engine_output_sample_rate else 0
+            final_audio_np = all_audio_segments_np[0]
+            for seg in all_audio_segments_np[1:]:
+                overlap = min(crossfade_samples, len(final_audio_np), len(seg))
+                if overlap > 0:
+                    fade_out = np.linspace(1.0, 0.0, overlap, dtype=final_audio_np.dtype)
+                    fade_in = np.linspace(0.0, 1.0, overlap, dtype=seg.dtype)
+                    blended = final_audio_np[-overlap:] * fade_out + seg[:overlap] * fade_in
+                    final_audio_np = np.concatenate([final_audio_np[:-overlap], blended, seg[overlap:]])
+                else:
+                    final_audio_np = np.concatenate([final_audio_np, seg])
+        else:
+            final_audio_np = all_audio_segments_np[0]
+        logger.info(f"All {len(all_audio_segments_np)} chunk audios combined into final output")
         
         # Apply global audio processing
         if config_manager.get_bool("audio_processing.enable_silence_trimming", False):
@@ -1304,10 +1679,6 @@ async def generate_speech_endpoint(
     headers = {"Content-Disposition": f'attachment; filename="{download_filename}"'}
     
     logger.info(f"Successfully generated audio: {download_filename}, {len(encoded_audio)} bytes")
-    
-    # Clean up temporary reference audio file
-    if temp_ref_audio_path and temp_ref_audio_path.exists():
-        temp_ref_audio_path.unlink(missing_ok=True)
     
     return StreamingResponse(
         io.BytesIO(encoded_audio), 

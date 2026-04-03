@@ -1,25 +1,33 @@
-# Caddyfile for Chatterbox TTS Server with automatic HTTPS
-# This configuration provides HTTPS access via domain name with automatic Let's Encrypt certificates
+# Caddyfile for audio-inference.oshara.ai
+# Routes requests to the ASR (STT) and TTS services.
 
-# Domain-based configuration with automatic HTTPS
-stts.careerlink.ai {
-    # Reverse proxy to the TTS server container (handles both HTTP and WebSocket)
-    reverse_proxy chatterbox-tts-server:8004
-    
+audio-inference.oshara.ai {
+    # Proxy STT (ASR) API under /stt/* to the ASR container on shared Docker network
+    handle_path /stt/* {
+        reverse_proxy asr:8000
+    }
+
+    # Proxy TTS endpoints under /tts/* to the Chatterbox TTS server
+    handle_path /tts/* {
+        reverse_proxy host.docker.internal:4000
+    }
+
+    # Fallback: direct root path to a simple status message or redirect
+    handle_path / {
+        respond "audio-inference reverse proxy: use /stt/ or /tts/" 200
+    }
+
     # Enable request logging
     log {
         output stdout
         format console
-        level DEBUG
+        level INFO
     }
-    
+
     # Add security headers
     header {
-        # Prevent MIME type sniffing
         X-Content-Type-Options nosniff
-        # Enable XSS protection
         X-XSS-Protection "1; mode=block"
-        # Prevent clickjacking
         X-Frame-Options DENY
     }
 }

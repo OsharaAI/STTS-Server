@@ -2,21 +2,25 @@ version: '3.8'
 
 services:
   # Caddy reverse proxy for HTTPS
-  # caddy:
-  #   image: caddy:2-alpine
-  #   command: sh -c "apk add --no-cache nss-tools && caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"
-  #   restart: unless-stopped
-  #   ports:
-  #     - "80:80"
-  #     - "443:443"
-  #   volumes:
-  #     - ./Caddyfile:/etc/caddy/Caddyfile
-  #     - caddy_data:/data
-  #     - caddy_config:/config
-  #   networks:
-  #     - chatterbox-network
-  #   depends_on:
-  #     - chatterbox-tts-server
+  caddy:
+    image: caddy:2-alpine
+    command: sh -c "apk add --no-cache nss-tools && caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - chatterbox-network
+      - stt-network
+    depends_on:
+      - chatterbox-tts-server
+    # Ensure the container can reach services bound to the Docker host (ASR/TTS)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
   chatterbox-tts-server:
     build:
@@ -42,11 +46,6 @@ services:
       - hf_cache:/app/hf_cache
     
     # --- GPU Support (NVIDIA) ---
-    # The 'deploy' key is the modern way to request GPU resources.
-    # If you get a 'CDI device injection failed' error, comment out the 'deploy' section
-    # and uncomment the 'runtime: nvidia' line below.
-    
-    # Method 1: Modern Docker Compose (Recommended)
     deploy:
       resources:
         reservations:
@@ -55,9 +54,6 @@ services:
               count: 1
               capabilities: [gpu]
 
-    # Method 2: Legacy Docker Compose (for older setups)
-    # runtime: nvidia
-
     restart: unless-stopped
     environment:
       # Enable faster Hugging Face downloads inside the container
@@ -65,14 +61,19 @@ services:
       # Make NVIDIA GPUs visible and specify capabilities for PyTorch
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      # Reduce CUDA memory fragmentation for long-running generation workloads
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Define the named volumes
 volumes:
   hf_cache:
-  # caddy_data:
   caddy_config:
+  caddy_data:
 
 # Define the network for service communication
 networks:
   chatterbox-network:
     driver: bridge
+  stt-network:
+    external: true
+    name: stt_default

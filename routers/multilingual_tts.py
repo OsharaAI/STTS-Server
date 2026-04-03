@@ -37,6 +37,7 @@ SUPPORTED_LANGUAGES = {
     "ja": "Japanese",
     "ko": "Korean",
     "ms": "Malay",
+    "ne": "Nepali",
     "nl": "Dutch",
     "no": "Norwegian",
     "pl": "Polish",
@@ -78,7 +79,7 @@ async def get_supported_languages():
 @router.post(
     "/generate",
     summary="Generate multilingual TTS audio",
-    description="Generate speech in 23 languages with optional voice cloning",
+    description="Generate speech in 24 languages with optional voice cloning",
     responses={
         200: {
             "description": "Successfully generated audio file (WAV format)",
@@ -110,8 +111,8 @@ async def generate_multilingual_tts(
     """
     Generate multilingual TTS audio with optional voice cloning.
     
-    **Supported Languages (23):**
-    ar, da, de, el, en, es, fi, fr, he, hi, it, ja, ko, ms, nl, no, pl, pt, ru, sv, sw, tr, zh
+    **Supported Languages (24):**
+    ar, da, de, el, en, es, fi, fr, he, hi, it, ja, ko, ms, ne, nl, no, pl, pt, ru, sv, sw, tr, zh
     
     **Parameters:**
     - **text**: Text to synthesize (in target language)

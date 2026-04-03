@@ -11,11 +11,16 @@ server:
 model:
   repo_id: ResembleAI/chatterbox
   use_multilingual: true
+  local_path: finetuned_models/video-rendering-inference-server/chatterbox-finetuning-multilingual/checkpoints_lora/merged_model
 tts_engine:
   device: cuda
   predefined_voices_path: voices
   reference_audio_path: reference_audio
   default_voice_id: Emily.wav
+stt_engine:
+  device: cpu
+  model_size: base
+  language: auto
 paths:
   model_cache: model_cache
   output: outputs

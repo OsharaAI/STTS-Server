@@ -45,6 +45,7 @@ praat-parselmouth              # Python interface to Praat speech analysis
 # --- Web & API Utilities ---
 python-multipart               # Form data parsing for FastAPI
 requests                       # HTTP client library
+boto3                          # AWS SDK for Python
 Jinja2                        # Template engine
 aiofiles                      # Async file operations
 hf_transfer                     # Speed up file transfers with the Hugging Face Hub.
@@ -56,6 +57,8 @@ watchdog                      # File system event monitoring
 unidecode                     # Unicode text transliteration
 inflect                       # Natural language inflection
 tqdm                          # Progress bars for loops
+langdetect                    # Detect Nepali text when language_id is ambiguous
+nepali-num2word              # Convert Nepali numerals to words
 
 # ============================================================================
 # INSTALLATION NOTES:

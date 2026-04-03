@@ -9,9 +9,18 @@ import re
 import time
 import io
 import uuid
+import tempfile
+import urllib.parse
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, Set, List
 from pydub import AudioSegment
+import requests
+
+try:
+    import boto3
+    BOTO3_AVAILABLE = True
+except ImportError:
+    BOTO3_AVAILABLE = False
 
 import numpy as np
 import soundfile as sf
@@ -1293,3 +1302,58 @@ class PerformanceMonitor:
         if self.logger:
             self.logger.log(log_level, full_report_str)
         return full_report_str
+
+
+def download_audio_from_url(url: str) -> Optional[Path]:
+    """
+    Downloads an audio file from an HTTP/HTTPS or S3 URL to a temporary file.
+    Returns the Path to the downloaded file or None if it fails.
+    """
+    if not url:
+        return None
+        
+    try:
+        if url.startswith("s3://"):
+            if not BOTO3_AVAILABLE:
+                logger.error("boto3 is required to download s3:// URLs")
+                return None
+            parsed = urllib.parse.urlparse(url)
+            bucket = parsed.netloc
+            key = parsed.path.lstrip('/')
+            
+            suffix = Path(key).suffix
+            if not suffix:
+                suffix = ".wav"
+                
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            temp_file.close() # Close to prevent file locking issues on some systems
+            
+            s3 = boto3.client('s3')
+            s3.download_file(bucket, key, temp_file.name)
+            logger.info(f"Successfully downloaded S3 reference audio from {url} to {temp_file.name}")
+            return Path(temp_file.name)
+            
+        elif url.startswith("http://") or url.startswith("https://"):
+            response = requests.get(url, stream=True)
+            response.raise_for_status()
+            
+            parsed = urllib.parse.urlparse(url)
+            suffix = Path(parsed.path).suffix
+            if not suffix:
+                suffix = ".wav"
+                
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+            
+            with open(temp_file.name, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            logger.info(f"Successfully downloaded HTTP reference audio from {url} to {temp_file.name}")
+            return Path(temp_file.name)
+            
+        else:
+            logger.error(f"Unsupported URL scheme (expected http://, https://, or s3://): {url}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Failed to download audio from {url}: {e}", exc_info=True)
+        return None

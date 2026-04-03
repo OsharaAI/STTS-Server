@@ -39,6 +39,8 @@ aiofiles
 unidecode
 inflect
 tqdm
+langdetect
+nepali-num2word
 hf_transfer                     # Speed up file transfers
 
 # Audio Post-processing

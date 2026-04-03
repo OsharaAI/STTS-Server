@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from pathlib import Path
 import os
+import inspect
+import re
 
 import librosa
 import torch
@@ -16,6 +18,18 @@ from .models.s3gen import S3GEN_SR, S3Gen
 from .models.tokenizers import MTLTokenizer
 from .models.voice_encoder import VoiceEncoder
 from .models.t3.modules.cond_enc import T3Cond
+
+try:
+    from langdetect import detect
+    from langdetect.lang_detect_exception import LangDetectException
+except ImportError:
+    detect = None
+    LangDetectException = Exception
+
+try:
+    import nepali_num2word  # type: ignore
+except ImportError:
+    nepali_num2word = None
 
 
 REPO_ID = "ResembleAI/chatterbox"
@@ -45,7 +59,85 @@ SUPPORTED_LANGUAGES = {
   "sw": "Swahili",
   "tr": "Turkish",
   "zh": "Chinese",
+  "ne": "Nepali",
 }
+
+_DEVANAGARI_TO_ASCII_DIGITS = str.maketrans("०१२३४५६७८९", "0123456789")
+_NEPALI_DIGIT_PATTERN = re.compile(r"[0-9०-९]+")
+
+
+def _resolve_nepali_num2word_fn():
+    if nepali_num2word is None:
+        return None
+
+    candidates = [
+        "num2word",
+        "num_to_word",
+        "number_to_word",
+        "convert_num_to_word",
+        "convert_number_to_word",
+        "convert_to_words",
+        "convert",
+    ]
+    for name in candidates:
+        fn = getattr(nepali_num2word, name, None)
+        if callable(fn):
+            return fn
+    return None
+
+
+_NEPALI_NUM2WORD_FN = _resolve_nepali_num2word_fn()
+_NEPALI_NUM2WORD_SUPPORTS_LANG = False
+if _NEPALI_NUM2WORD_FN is not None:
+    try:
+        _NEPALI_NUM2WORD_SUPPORTS_LANG = "lang" in inspect.signature(_NEPALI_NUM2WORD_FN).parameters
+    except Exception:
+        _NEPALI_NUM2WORD_SUPPORTS_LANG = False
+
+
+def _is_nepali_text(text: str, language_id: str = None) -> bool:
+    lang = (language_id or "").strip().lower()
+    if lang in {"ne", "nepali"}:
+        return True
+
+    if detect is None or not text or not text.strip():
+        return False
+
+    try:
+        return detect(text) == "ne"
+    except LangDetectException:
+        return False
+    except Exception:
+        return False
+
+
+def _convert_nepali_numbers_to_words(text: str) -> str:
+    if not text or _NEPALI_NUM2WORD_FN is None:
+        return text
+
+    def _replace(match: re.Match) -> str:
+        token = match.group(0)
+        ascii_token = token.translate(_DEVANAGARI_TO_ASCII_DIGITS)
+        if not ascii_token.isdigit():
+            return token
+
+        try:
+            if _NEPALI_NUM2WORD_SUPPORTS_LANG:
+                converted = _NEPALI_NUM2WORD_FN(int(ascii_token), lang="np")
+            else:
+                converted = _NEPALI_NUM2WORD_FN(int(ascii_token))
+        except Exception:
+            try:
+                if _NEPALI_NUM2WORD_SUPPORTS_LANG:
+                    converted = _NEPALI_NUM2WORD_FN(ascii_token, lang="np")
+                else:
+                    converted = _NEPALI_NUM2WORD_FN(ascii_token)
+            except Exception:
+                return token
+
+        return str(converted) if converted is not None else token
+
+    return _NEPALI_DIGIT_PATTERN.sub(_replace, text)
 
 
 def punc_norm(text: str) -> str:
@@ -242,6 +334,9 @@ class ChatterboxMultilingualTTS:
         min_p=0.05,
         top_p=1.0,
     ):
+        if _is_nepali_text(text, language_id):
+            text = _convert_nepali_numbers_to_words(text)
+
         # Validate language_id
         if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
             supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())

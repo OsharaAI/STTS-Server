@@ -1272,7 +1272,7 @@ document.addEventListener('DOMContentLoaded', async function() {
         const startTime = performance.now();
         const jsonData = getTTSFormData();
         try {
-            const response = await fetch(`${API_BASE_URL}/tts`, {
+            const response = await fetch(`${API_BASE_URL}/generate`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(jsonData)

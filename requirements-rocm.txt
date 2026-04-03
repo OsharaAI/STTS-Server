@@ -27,6 +27,8 @@ python-multipart # For file uploads
 requests # For health checks or other potential uses
 PyYAML # For parsing presets.yaml AND primary config.yaml
 tqdm
+langdetect
+nepali-num2word
 
 # Audio Post-processing
 pydub

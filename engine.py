@@ -286,6 +286,8 @@ def load_model() -> bool:
         model_repo_id_config = config_manager.get_string(
             "model.repo_id", "ResembleAI/chatterbox"
         )
+        local_model_path_cfg = config_manager.get_string("model.local_path", "").strip()
+        use_local_model = local_model_path_cfg.lower() not in {"", "none", "null"}
 
         # Check if multilingual model should be used
         use_multilingual = config_manager.get_bool("model.use_multilingual", False)
@@ -293,32 +295,64 @@ def load_model() -> bool:
         # Check if multilingual support is available (only in chatterbox-vllm package)
 
         if use_multilingual:
-            logger.info(
-                f"Attempting to load MULTILINGUAL model."
-            )
+            logger.info("Attempting to load MULTILINGUAL model.")
         else:
             logger.info(
                 f"Attempting to load STANDARD model directly using from_pretrained (expected from Hugging Face repository: {model_repo_id_config} or library default)."
             )
+
+        local_model_dir: Optional[Path] = None
+        if use_local_model:
+            configured_path = Path(local_model_path_cfg).expanduser()
+            local_model_dir = configured_path if configured_path.is_absolute() else (Path.cwd() / configured_path)
+            local_model_dir = local_model_dir.resolve()
+
+            if not local_model_dir.exists() or not local_model_dir.is_dir():
+                logger.error(
+                    f"Configured model.local_path does not exist or is not a directory: {local_model_dir}"
+                )
+                chatterbox_model = None
+                MODEL_LOADED = False
+                return False
+
+            logger.info(f"Using local finetuned model path: {local_model_dir}")
         
         logger.info(f"Loading TTS model... on device {model_device} and multilingual={use_multilingual}")
 
         try:
             # Load either multilingual or standard model based on configuration
             if use_multilingual:
-                chatterbox_model = ChatterboxMultilingualTTS.from_pretrained(device=model_device)
-                logger.info(
-                    f"Successfully loaded MULTILINGUAL TTS model on {model_device} (supports 23 languages)."
-                )
+                if local_model_dir is not None:
+                    chatterbox_model = ChatterboxMultilingualTTS.from_local(
+                        ckpt_dir=local_model_dir,
+                        device=model_device,
+                    )
+                    logger.info(
+                        f"Successfully loaded local MULTILINGUAL TTS model from '{local_model_dir}' on {model_device}."
+                    )
+                else:
+                    chatterbox_model = ChatterboxMultilingualTTS.from_pretrained(device=model_device)
+                    logger.info(
+                        f"Successfully loaded MULTILINGUAL TTS model on {model_device} (supports 23 languages)."
+                    )
             else:
-                # Directly use from_pretrained. This will utilize the standard Hugging Face cache.
-                # The ChatterboxTTS.from_pretrained method handles downloading if the model is not in the cache.
-                chatterbox_model = ChatterboxTTS.from_pretrained(device=model_device)
-                # The actual repo ID used by from_pretrained is often internal to the library,
-                # but logging the configured one provides user context.
-                logger.info(
-                    f"Successfully loaded STANDARD TTS model using from_pretrained on {model_device} (expected from '{model_repo_id_config}' or library default)."
-                )
+                if local_model_dir is not None:
+                    chatterbox_model = ChatterboxTTS.from_local(
+                        ckpt_dir=local_model_dir,
+                        device=model_device,
+                    )
+                    logger.info(
+                        f"Successfully loaded local STANDARD TTS model from '{local_model_dir}' on {model_device}."
+                    )
+                else:
+                    # Directly use from_pretrained. This will utilize the standard Hugging Face cache.
+                    # The ChatterboxTTS.from_pretrained method handles downloading if the model is not in the cache.
+                    chatterbox_model = ChatterboxTTS.from_pretrained(device=model_device)
+                    # The actual repo ID used by from_pretrained is often internal to the library,
+                    # but logging the configured one provides user context.
+                    logger.info(
+                        f"Successfully loaded STANDARD TTS model using from_pretrained on {model_device} (expected from '{model_repo_id_config}' or library default)."
+                    )
         except Exception as e_hf:
             logger.error(
                 f"Failed to load model using from_pretrained (expected from '{model_repo_id_config}' or library default): {e_hf}",

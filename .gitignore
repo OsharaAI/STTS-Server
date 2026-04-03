@@ -46,3 +46,6 @@ htmlcov/
 
 # Ignore log files
 *.log
+
+
+finetuned_models/

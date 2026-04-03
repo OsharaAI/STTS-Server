@@ -434,38 +434,28 @@
                             </div>
 
                             <div id="clone-options" class="mb-6 hidden">
-                                <label for="clone-reference-select" class="label-base">Reference Audio File</label>
-                                <p class="text-xs text-slate-500 dark:text-slate-400 mb-2">
-                                    Select an uploaded <code class="code-inline">.wav</code> or <code
-                                        class="code-inline">.mp3</code> file.
-                                    For best results, use clean audio recordings.
-                                </p>
-                                <div class="flex items-center gap-2">
-                                    <select id="clone-reference-select" name="clone_reference_select"
-                                        class="select-base flex-grow">
-                                        <option value="none">-- Select Reference File --</option>
-                                    </select>
-                                    <input type="file" id="clone-file-input" class="hidden" multiple accept=".wav,.mp3"
-                                        aria-label="Upload reference audio file">
-                                    <button type="button" id="clone-import-button" class="btn-import"
-                                        title="Import new reference files">
-                                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
-                                            <path
-                                                d="M9.25 13.25a.75.75 0 0 0 1.5 0V4.636l2.955 3.129a.75.75 0 0 0 1.09-1.03l-4.25-4.5a.75.75 0 0 0-1.09 0l-4.25 4.5a.75.75 0 1 0 1.09 1.03L9.25 4.636v8.614Z" />
-                                            <path
-                                                d="M3.5 12.75a.75.75 0 0 0-1.5 0v2.5A2.75 2.75 0 0 0 4.75 18h10.5A2.75 2.75 0 0 0 18 15.25v-2.5a.75.75 0 0 0-1.5 0v2.5c0 .69-.56 1.25-1.25 1.25H4.75c-.69 0-1.25-.56-1.25-1.25v-2.5Z" />
-                                        </svg>
-                                        Import
-                                    </button>
-                                    <button type="button" id="clone-refresh-button" class="btn-refresh"
-                                        title="Refresh reference file list">
-                                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
-                                            <path fill-rule="evenodd"
-                                                d="M15.312 11.424a5.5 5.5 0 0 1-9.201-4.42 5.5 5.5 0 0 1 10.89 2.01a.75.75 0 0 1-1.49.174a4 4 0 0 0-7.486-2.641a4 4 0 0 0 6.688 2.947a.75.75 0 0 1 .999.057l-.004-.005ZM4.688 8.576a5.5 5.5 0 0 1 9.201 4.42a5.5 5.5 0 0 1-10.89-2.01a.75.75 0 0 1 1.49-.174a4 4 0 0 0 7.486 2.641a4 4 0 0 0-6.688-2.947a.75.75 0 0 1-.999-.057l.004.005Z"
-                                                clip-rule="evenodd" />
-                                        </svg>
-                                        Refresh
-                                    </button>
+                                <label class="label-base mb-2">Reference Audio Source</label>
+                                <div class="flex items-center gap-4 mb-3">
+                                    <label class="flex items-center text-sm text-slate-700 dark:text-slate-300 cursor-pointer">
+                                        <input type="radio" name="clone_source_type" value="file" class="mr-2" checked>
+                                        Local File
+                                    </label>
+                                    <label class="flex items-center text-sm text-slate-700 dark:text-slate-300 cursor-pointer">
+                                        <input type="radio" name="clone_source_type" value="url" class="mr-2">
+                                        S3 / HTTP (s) URL
+                                    </label>
+                                </div>
+                                <div id="clone-source-file-container">
+                                    <p class="text-xs text-slate-500 dark:text-slate-400 mb-2">
+                                        Select a <code class="code-inline">.wav</code> or <code class="code-inline">.mp3</code> file. Clean audio works best.
+                                    </p>
+                                    <input type="file" id="clone-file-input" accept=".wav,.mp3" class="input-base w-full">
+                                </div>
+                                <div id="clone-source-url-container" class="hidden">
+                                    <p class="text-xs text-slate-500 dark:text-slate-400 mb-2">
+                                        Provide an HTTP(s) or an S3 URL (e.g., <code class="code-inline">s3://my-bucket/audio.wav</code>).
+                                    </p>
+                                    <input type="text" id="clone-url-input" placeholder="https://... or s3://..." class="input-base w-full">
                                 </div>
                             </div>
 

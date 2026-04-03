@@ -51,6 +51,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "model": {  # Added section for model source configuration
         "repo_id": "ResembleAI/chatterbox",  # Default Hugging Face repository ID for the model
         "use_multilingual": True,  # Whether to use the multilingual model (supports 23 languages)
+        "local_path": "",  # Optional local checkpoint directory. If set, load model from this path.
     },
     "tts_engine": {
         "device": "auto",  # TTS processing device: 'auto', 'cuda', 'mps', or 'cpu'.
