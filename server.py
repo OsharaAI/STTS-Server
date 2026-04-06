@@ -234,6 +234,12 @@ def _clear_cuda_memory_after_generate() -> None:
     if not torch.cuda.is_available():
         return
 
+    if engine.has_cuda_device_assert():
+        logger.warning(
+            "Skipping CUDA cache clear because CUDA device-side assert was previously triggered in this process."
+        )
+        return
+
     try:
         torch.cuda.empty_cache()
         if hasattr(torch.cuda, "ipc_collect"):
@@ -265,6 +271,18 @@ def _split_chunk_for_retry(chunk: str, min_chunk_size: int = 50) -> List[str]:
         return []
 
     return [c for c in sub_chunks if c and c.strip()]
+
+
+def _cuda_assert_http_detail() -> str:
+    """Build a consistent, actionable API error for CUDA assert failures."""
+    last_error = engine.get_cuda_device_assert_details()
+    suffix = f" Last error: {last_error}" if last_error else ""
+    return (
+        "CUDA device-side assert was triggered in this server process. "
+        "The CUDA context is now invalid for further synthesis. "
+        "Restart the container/process, then retry with CUDA_LAUNCH_BLOCKING=1 for accurate stack traces."
+        f"{suffix}"
+    )
 
 
 def _enforce_max_chunk_size(chunks: List[str], max_chars: int) -> List[str]:
@@ -1432,7 +1450,7 @@ async def generate_speech_endpoint(
     repetition_penalty: float = Form(1.2, description="Repetition penalty (1.0-2.0)"),
     split_text: bool = Form(True, description="Whether to split text into chunks"),
     chunk_size: int = Form(120, description="Target chunk size for text splitting (50-500)", ge=50, le=500),
-    language_id: Optional[str] = Form('hi', description="Language code for multilingual model (e.g., 'en', 'fr', 'es', 'zh')"),
+    language_id: Optional[str] = Form('ne', description="Language code for multilingual model (e.g., 'en', 'fr', 'es', 'zh')"),
 ):
     """
     Generates speech audio from text with advanced parameters and optional reference audio for voice cloning.
@@ -1444,8 +1462,10 @@ async def generate_speech_endpoint(
             status_code=503,
             detail="TTS engine model is not currently loaded or available.",
         )
+    if engine.has_cuda_device_assert():
+        raise HTTPException(status_code=503, detail=_cuda_assert_http_detail())
     
-    logger.info(f"Received /generate request with text: '{text[:50]}...', reference_audio: '{reference_audio.filename if reference_audio else 'None'}', language_id: {language_id}")
+    logger.info(f"Received /generate request with text: '{text[:50]}...', reference_audio: '{reference_audio.filename if reference_audio else 'None'}', language_id: {language_id}, speed factor: {speed_factor}, cfg_weight: {cfg_weight}")
 
     if _should_apply_nepali_num2word(text, language_id):
         if _NEPALI_NUM2WORD_FN is None:
@@ -1565,6 +1585,9 @@ async def generate_speech_endpoint(
 
                 if chunk_audio_tensor is None or chunk_sr_from_engine is None:
                     # Likely synthesis failure (including possible CUDA OOM in engine layer).
+                    if engine.has_cuda_device_assert():
+                        raise HTTPException(status_code=503, detail=_cuda_assert_http_detail())
+
                     sub_chunks = _split_chunk_for_retry(chunk, min_chunk_size=50)
                     if sub_chunks:
                         logger.warning(
@@ -1727,6 +1750,8 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
             status_code=503,
             detail="TTS engine model is not currently loaded or available.",
         )
+    if engine.has_cuda_device_assert():
+        raise HTTPException(status_code=503, detail=_cuda_assert_http_detail())
 
     try:
         # Use the provided seed or the default

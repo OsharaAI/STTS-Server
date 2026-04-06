@@ -3,8 +3,11 @@ from pathlib import Path
 import os
 import inspect
 import re
+import time
+from typing import Generator, Optional, Tuple
 
 import librosa
+import numpy as np
 import torch
 import perth
 import torch.nn.functional as F
@@ -394,3 +397,161 @@ class ChatterboxMultilingualTTS:
             wav = wav.squeeze(0).detach().cpu().numpy()
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
+
+    def _process_token_buffer(
+        self,
+        token_buffer,
+        all_tokens_so_far,
+        context_window,
+        start_time,
+        metrics,
+        fade_duration=0.02,
+    ):
+        """
+        Convert streamed token chunks into audio, mirroring the standard streaming path.
+        """
+        new_tokens = torch.cat(token_buffer, dim=-1)
+
+        if len(all_tokens_so_far) > 0:
+            context_tokens = (
+                all_tokens_so_far[-context_window:]
+                if len(all_tokens_so_far) > context_window
+                else all_tokens_so_far
+            )
+            tokens_to_process = torch.cat([context_tokens, new_tokens], dim=-1)
+            context_length = len(context_tokens)
+        else:
+            tokens_to_process = new_tokens
+            context_length = 0
+
+        clean_tokens = drop_invalid_tokens(tokens_to_process).to(self.device)
+        if len(clean_tokens) == 0:
+            return None, 0.0, False
+
+        wav, _ = self.s3gen.inference(
+            speech_tokens=clean_tokens,
+            ref_dict=self.conds.gen,
+        )
+        wav = wav.squeeze(0).detach().cpu().numpy()
+
+        if context_length > 0:
+            samples_per_token = len(wav) / len(clean_tokens)
+            skip_samples = int(context_length * samples_per_token)
+            audio_chunk = wav[skip_samples:]
+        else:
+            audio_chunk = wav
+
+        if len(audio_chunk) == 0:
+            return None, 0.0, False
+
+        fade_samples = int(fade_duration * self.sr)
+        audio_duration = len(audio_chunk) / self.sr
+        watermarked_chunk = self.watermarker.apply_watermark(audio_chunk, sample_rate=self.sr)
+
+        if fade_samples > 0:
+            if fade_samples > len(watermarked_chunk):
+                fade_samples = len(watermarked_chunk)
+            fade_in = np.linspace(0.0, 1.0, fade_samples, dtype=watermarked_chunk.dtype)
+            watermarked_chunk[:fade_samples] *= fade_in
+            fade_out = np.linspace(1.0, 0.0, fade_samples, dtype=watermarked_chunk.dtype)
+            watermarked_chunk[-fade_samples:] *= fade_out
+
+        audio_tensor = torch.from_numpy(watermarked_chunk).unsqueeze(0)
+
+        if metrics.chunk_count == 0:
+            metrics.latency_to_first_chunk = time.time() - start_time
+
+        metrics.chunk_count += 1
+        return audio_tensor, audio_duration, True
+
+    def generate_stream(
+        self,
+        text: str,
+        language_id: str,
+        audio_prompt_path: Optional[str] = None,
+        exaggeration: float = 0.5,
+        cfg_weight: float = 0.5,
+        temperature: float = 0.8,
+        repetition_penalty: float = 1.2,
+        min_p: float = 0.05,
+        top_p: float = 1.0,
+        chunk_size: int = 25,
+        context_window: int = 50,
+        fade_duration: float = 0.02,
+    ) -> Generator[Tuple[torch.Tensor, object], None, None]:
+        """
+        Streaming version of multilingual TTS generation.
+        """
+        start_time = time.time()
+        metrics = type("StreamingMetrics", (), {"latency_to_first_chunk": None, "rtf": None, "total_generation_time": None, "total_audio_duration": None, "chunk_count": 0})()
+
+        if _is_nepali_text(text, language_id):
+            text = _convert_nepali_numbers_to_words(text)
+
+        if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
+            supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
+            raise ValueError(
+                f"Unsupported language_id '{language_id}'. Supported languages: {supported_langs}"
+            )
+
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        else:
+            assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
+
+        if float(exaggeration) != float(self.conds.t3.emotion_adv[0, 0, 0].item()):
+            _cond: T3Cond = self.conds.t3
+            self.conds.t3 = T3Cond(
+                speaker_emb=_cond.speaker_emb,
+                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1),
+            ).to(device=self.device)
+
+        text = punc_norm(text)
+        text_tokens = self.tokenizer.text_to_tokens(
+            text,
+            language_id=language_id.lower() if language_id else None,
+        ).to(self.device)
+        text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
+
+        sot = self.t3.hp.start_text_token
+        eot = self.t3.hp.stop_text_token
+        text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+        text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+
+        total_audio_length = 0.0
+        all_tokens_processed = []
+
+        with torch.inference_mode():
+            for token_chunk in self.t3.inference_stream(
+                t3_cond=self.conds.t3,
+                text_tokens=text_tokens,
+                max_new_tokens=1000,
+                temperature=temperature,
+                cfg_weight=cfg_weight,
+                chunk_size=chunk_size,
+            ):
+                token_chunk = token_chunk[0]
+
+                audio_tensor, audio_duration, success = self._process_token_buffer(
+                    [token_chunk],
+                    all_tokens_processed,
+                    context_window,
+                    start_time,
+                    metrics,
+                    fade_duration,
+                )
+
+                if success:
+                    total_audio_length += audio_duration
+                    yield audio_tensor, metrics
+
+                if len(all_tokens_processed) == 0:
+                    all_tokens_processed = token_chunk
+                else:
+                    all_tokens_processed = torch.cat([all_tokens_processed, token_chunk], dim=-1)
+
+        metrics.total_generation_time = time.time() - start_time
+        metrics.total_audio_duration = total_audio_length
+        if total_audio_length > 0:
+            metrics.rtf = metrics.total_generation_time / total_audio_length

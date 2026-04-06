@@ -31,6 +31,37 @@ model_device: Optional[str] = (
 # Key: audio_prompt_path (str), Value: True (conds are on the model instance)
 _last_prepared_voice: Optional[str] = None
 _warmup_done: bool = False
+_cuda_device_assert_triggered: bool = False
+_cuda_device_assert_last_error: Optional[str] = None
+
+
+def _is_cuda_device_assert_error(exc: BaseException) -> bool:
+    """Return True when an exception indicates a CUDA device-side assert."""
+    return "device-side assert triggered" in str(exc).lower()
+
+
+def _mark_cuda_device_assert(exc: BaseException, context: str) -> None:
+    """Persist CUDA assert state so subsequent requests can fail fast with clear guidance."""
+    global _cuda_device_assert_triggered, _cuda_device_assert_last_error
+    _cuda_device_assert_triggered = True
+    _cuda_device_assert_last_error = str(exc)
+    logger.critical(
+        "CUDA device-side assert detected during %s. "
+        "CUDA context is likely poisoned for this process. "
+        "Restart the container/process after fixing the bad input/indexing path. "
+        "For better stack traces, run with CUDA_LAUNCH_BLOCKING=1.",
+        context,
+    )
+
+
+def has_cuda_device_assert() -> bool:
+    """Expose whether a CUDA device-side assert was observed in this process."""
+    return _cuda_device_assert_triggered
+
+
+def get_cuda_device_assert_details() -> Optional[str]:
+    """Return last CUDA assert error string, if any."""
+    return _cuda_device_assert_last_error
 
 
 def set_seed(seed_value: int):
@@ -38,10 +69,21 @@ def set_seed(seed_value: int):
     Sets the seed for torch, random, and numpy for reproducibility.
     This is called if a non-zero seed is provided for generation.
     """
+    if _cuda_device_assert_triggered and model_device == "cuda":
+        raise RuntimeError(
+            "CUDA device-side assert was previously triggered in this process. "
+            "Restart the container/process before retrying on CUDA."
+        )
+
     torch.manual_seed(seed_value)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed_value)
-        torch.cuda.manual_seed_all(seed_value)  # if using multi-GPU
+        try:
+            torch.cuda.manual_seed(seed_value)
+            torch.cuda.manual_seed_all(seed_value)  # if using multi-GPU
+        except Exception as e:
+            if _is_cuda_device_assert_error(e):
+                _mark_cuda_device_assert(e, "set_seed")
+            raise
     if torch.backends.mps.is_available():
         torch.mps.manual_seed(seed_value)
     random.seed(seed_value)
@@ -218,6 +260,7 @@ def load_model() -> bool:
         bool: True if the model was loaded successfully, False otherwise.
     """
     global chatterbox_model, MODEL_LOADED, model_device
+    global _cuda_device_assert_triggered, _cuda_device_assert_last_error
 
     if MODEL_LOADED:
         logger.info("TTS model is already loaded.")
@@ -363,6 +406,8 @@ def load_model() -> bool:
             return False
 
         MODEL_LOADED = True
+        _cuda_device_assert_triggered = False
+        _cuda_device_assert_last_error = None
         if chatterbox_model:
             logger.info(
                 f"TTS Model loaded successfully on {model_device}. Engine sample rate: {chatterbox_model.sr} Hz."
@@ -416,6 +461,12 @@ def synthesize(
 
     if not MODEL_LOADED or chatterbox_model is None:
         logger.error("TTS model is not loaded. Cannot synthesize audio.")
+        return None, None
+    if _cuda_device_assert_triggered and model_device == "cuda":
+        logger.error(
+            "Refusing synthesis after prior CUDA device-side assert. "
+            "Restart container/process and rerun with CUDA_LAUNCH_BLOCKING=1 to capture root cause."
+        )
         return None, None
     logger.info(f"\nSynthesizing text: {text} language_id: {language_id}")
 
@@ -476,6 +527,8 @@ def synthesize(
         return wav_tensor, chatterbox_model.sr
 
     except Exception as e:
+        if _is_cuda_device_assert_error(e):
+            _mark_cuda_device_assert(e, "synthesize")
         logger.error(f"Error during TTS synthesis: {e}", exc_info=True)
         return None, None
 
@@ -490,6 +543,9 @@ def synthesize_stream(
     seed: int = 0,
     chunk_size: int = 25,
     language_id: Optional[str] = None,
+    repetition_penalty: float = 1.2,
+    min_p: float = 0.05,
+    top_p: float = 1.0,
 ) -> Generator[Tuple[Optional[torch.Tensor], Optional[Any]], None, None]:
     """
     Synthesizes audio stream from text using the loaded TTS model.
@@ -501,6 +557,14 @@ def synthesize_stream(
 
     if not MODEL_LOADED or chatterbox_model is None:
         logger.error("TTS model is not loaded. Cannot synthesize audio.")
+        yield None, None
+        return
+
+    if _cuda_device_assert_triggered and model_device == "cuda":
+        logger.error(
+            "Refusing streaming synthesis after prior CUDA device-side assert. "
+            "Restart container/process and rerun with CUDA_LAUNCH_BLOCKING=1 to capture root cause."
+        )
         yield None, None
         return
 
@@ -535,6 +599,13 @@ def synthesize_stream(
                 "chunk_size": chunk_size,
             }
 
+            if 'repetition_penalty' in generate_stream_signature.parameters:
+                kwargs["repetition_penalty"] = repetition_penalty
+            if 'min_p' in generate_stream_signature.parameters:
+                kwargs["min_p"] = min_p
+            if 'top_p' in generate_stream_signature.parameters:
+                kwargs["top_p"] = top_p
+
             if supports_language_id:
                 kwargs["language_id"] = language_id
             elif language_id and language_id != "en":
@@ -565,6 +636,8 @@ def synthesize_stream(
             yield audio, {}
 
     except Exception as e:
+        if _is_cuda_device_assert_error(e):
+            _mark_cuda_device_assert(e, "synthesize_stream")
         logger.error(f"Error during streaming TTS synthesis: {e}", exc_info=True)
         yield None, None
 
