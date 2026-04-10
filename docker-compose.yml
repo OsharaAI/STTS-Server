@@ -35,6 +35,8 @@ services:
     networks:
       - chatterbox-network
     volumes:
+      # Bind-mount application source for live code updates in development
+      - .:/app
       # Mount local config file for persistence
       - ./config.yaml:/app/config.yaml
       # Mount local directories for persistent app data

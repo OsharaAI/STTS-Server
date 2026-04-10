@@ -3,6 +3,7 @@
 # Streaming TTS API endpoint
 
 import logging
+import os
 import numpy as np
 import shutil
 import tempfile
@@ -19,10 +20,31 @@ import engine
 from config import (
     get_gen_default_cfg_weight,
 )
+import utils
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Streaming TTS"])
+
+DEFAULT_SAMPLE_RATE = 24000
+# Smaller chunk size = lower time-to-first-audio for streaming.
+# A moderately larger default reduces over-fragmented output and boundary hiccups.
+DEFAULT_STREAM_CHUNK_SIZE = int(os.getenv("TTS_STREAM_DEFAULT_CHUNK_SIZE", "80"))
+MIN_STREAM_CHUNK_SIZE = 10
+MAX_STREAM_CHUNK_SIZE = 500
+
+
+def _resolve_sample_rate() -> int:
+    return int(getattr(engine.chatterbox_model, "sr", DEFAULT_SAMPLE_RATE))
+
+
+def _normalize_chunk_size(raw_chunk_size: Optional[int]) -> int:
+    try:
+        chunk_size = int(raw_chunk_size) if raw_chunk_size is not None else DEFAULT_STREAM_CHUNK_SIZE
+    except (TypeError, ValueError):
+        return DEFAULT_STREAM_CHUNK_SIZE
+
+    return max(MIN_STREAM_CHUNK_SIZE, min(MAX_STREAM_CHUNK_SIZE, chunk_size))
 
 
 def _audio_chunk_generator(
@@ -56,8 +78,9 @@ def _audio_chunk_generator(
     # Overlap-add crossfade to eliminate boundary artifacts between chunks.
     # Each chunk from the model has fade-in/fade-out applied (see _process_token_buffer).
     # We blend the overlapping fade regions to maintain smooth amplitude.
-    sample_rate = 24000  # Chatterbox default
-    crossfade_ms = 20  # must match fade_duration in _process_token_buffer (0.02s)
+    sample_rate = _resolve_sample_rate()
+    # Keep crossfade small for lower latency.
+    crossfade_ms = int(os.getenv("TTS_STREAM_CROSSFADE_MS", "10"))  # ms
     crossfade_samples = int(crossfade_ms / 1000.0 * sample_rate)
     prev_tail = None  # holds the last crossfade_samples of the previous chunk
 
@@ -68,7 +91,7 @@ def _audio_chunk_generator(
     max_silent_chunks = 3  # stop after 3 consecutive silent chunks
     has_produced_voiced = False  # track if any voiced audio was produced
 
-    for audio_chunk, metrics in stream:
+    for audio_chunk, _metrics in stream:
         if audio_chunk is None:
             continue
 
@@ -129,6 +152,7 @@ async def generate_stream(
     background_tasks: BackgroundTasks,
     text: str = Form(..., description="Text to convert to speech"),
     reference_audio: Optional[UploadFile] = File(None, description="Optional reference audio file for voice cloning"),
+    reference_audio_url: Optional[str] = Form(None, description="Optional reference audio URL for voice cloning (http/https/s3)"),
     exaggeration: float = Form(0.5, description="Voice exaggeration level (0.25-2.0)"),
     temperature: float = Form(0.8, description="Sampling temperature (0.05-5.0)"),
     cfg_weight: Optional[float] = Form(None, description="Classifier-free guidance weight (0.2-1.0)"),
@@ -139,7 +163,12 @@ async def generate_stream(
     top_p: float = Form(1.0, description="Top-p/nucleus sampling (0.0-1.0)"),
     repetition_penalty: float = Form(1.2, description="Repetition penalty (1.0-2.0)"),
     split_text: bool = Form(True, description="Whether to split text into chunks"),
-    chunk_size: int = Form(120, description="Target chunk size for text splitting (50-500)", ge=50, le=500),
+    chunk_size: int = Form(
+        DEFAULT_STREAM_CHUNK_SIZE,
+        description="Speech token chunk size for streaming (lower = faster first chunk)",
+        ge=MIN_STREAM_CHUNK_SIZE,
+        le=MAX_STREAM_CHUNK_SIZE,
+    ),
     language_id: Optional[str] = Form("ne", description="Language code for multilingual model (e.g., 'en', 'fr', 'es', 'zh')"),
 ):
     """
@@ -197,10 +226,30 @@ async def generate_stream(
             raise HTTPException(status_code=400, detail=f"Failed to process reference audio: {str(e)}")
         finally:
             await reference_audio.close()
+    elif reference_audio_url:
+        downloaded = utils.download_audio_from_url(reference_audio_url)
+        if downloaded is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to download reference_audio_url: {reference_audio_url}",
+            )
+        audio_prompt_path = str(downloaded)
+        # Ensure temporary download is cleaned up after request finishes.
+        background_tasks.add_task(
+            lambda p: Path(p).unlink(missing_ok=True),
+            audio_prompt_path,
+        )
 
     # Keep parity with /generate for request schema while mapping only
     # stream-supported params to engine.synthesize_stream.
-    if any([speed_factor is not None, diffusion_steps != 10, min_p != 0.05, top_p != 1.0, repetition_penalty != 1.2, split_text]):
+    if any([
+        speed_factor is not None,
+        diffusion_steps != 10,
+        min_p != 0.05,
+        top_p != 1.0,
+        repetition_penalty != 1.2,
+        split_text is not True,
+    ]):
         logger.debug(
             "Stream endpoint received /generate-compatible params that are currently ignored by stream backend: "
             f"speed_factor={speed_factor}, diffusion_steps={diffusion_steps}, min_p={min_p}, "
@@ -214,6 +263,8 @@ async def generate_stream(
         f"Voice: {'reference_audio' if audio_prompt_path else 'Default'} | "
         f"Lang: {language_id} | Seed: {seed}"
     )
+
+    sample_rate = _resolve_sample_rate()
 
     return StreamingResponse(
         _audio_chunk_generator(
@@ -231,7 +282,7 @@ async def generate_stream(
         ),
         media_type="application/octet-stream",
         headers={
-            "X-Sample-Rate": str(24000), # Assuming default model SR
+            "X-Sample-Rate": str(sample_rate),
             "X-Encoding": "float32",
         }
     )
@@ -266,13 +317,15 @@ async def websocket_stream_tts(websocket: WebSocket):
         await websocket.close()
         return
 
+    sample_rate = _resolve_sample_rate()
+
     logger.info("WebSocket streaming TTS connection established")
 
     await websocket.send_json({
         "type": "ready",
         "message": "Streaming TTS ready",
         "audio": {
-            "sample_rate": 24000,
+            "sample_rate": sample_rate,
             "encoding": "float32",
         },
     })
@@ -316,42 +369,66 @@ async def websocket_stream_tts(websocket: WebSocket):
             exaggeration = float(message.get("exaggeration", 0.5))
             cfg_weight = float(message.get("cfg_weight", get_gen_default_cfg_weight()))
             seed = int(message.get("seed", 0))
-            chunk_size = int(message.get("chunk_size", 120))
-            language_id = message.get("language_id", "ne")
+            chunk_size = _normalize_chunk_size(message.get("chunk_size", DEFAULT_STREAM_CHUNK_SIZE))
+            language_id = message.get("language_id") or None
             repetition_penalty = float(message.get("repetition_penalty", 1.2))
             min_p = float(message.get("min_p", 0.05))
             top_p = float(message.get("top_p", 1.0))
 
+            # Optional reference audio URL for voice cloning.
+            audio_prompt_path: Optional[str] = None
+            ref_url = (message.get("reference_audio_url") or message.get("reference_audio") or "").strip()
+            if ref_url:
+                downloaded = utils.download_audio_from_url(ref_url)
+                if downloaded is None:
+                    await websocket.send_json(
+                        {
+                            "type": "error",
+                            "message": f"Failed to download reference_audio_url: {ref_url}",
+                        }
+                    )
+                    continue
+                audio_prompt_path = str(downloaded)
+
             await websocket.send_json({
                 "type": "start",
-                "message": "Synthesis started",
-                "meta": {
-                    "sample_rate": 24000,
-                    "encoding": "float32",
-                    "language_id": language_id,
-                    "chunk_size": chunk_size,
-                },
-            })
+                    "message": "Synthesis started",
+                    "meta": {
+                        "sample_rate": sample_rate,
+                        "encoding": "float32",
+                        "language_id": language_id,
+                        "chunk_size": chunk_size,
+                        "has_reference_audio": bool(audio_prompt_path),
+                    },
+                })
 
             try:
                 chunk_count = 0
-                for chunk in _audio_chunk_generator(
-                    text=text,
-                    audio_prompt_path=None,
-                    temperature=temperature,
-                    exaggeration=exaggeration,
-                    cfg_weight=cfg_weight,
-                    seed=seed,
-                    chunk_size=chunk_size,
-                    language_id=language_id,
-                    repetition_penalty=repetition_penalty,
-                    min_p=min_p,
-                    top_p=top_p,
-                ):
-                    if not chunk:
-                        continue
-                    await websocket.send_bytes(chunk)
-                    chunk_count += 1
+                try:
+                    for chunk in _audio_chunk_generator(
+                        text=text,
+                        audio_prompt_path=audio_prompt_path,
+                        temperature=temperature,
+                        exaggeration=exaggeration,
+                        cfg_weight=cfg_weight,
+                        seed=seed,
+                        chunk_size=chunk_size,
+                        language_id=language_id,
+                        repetition_penalty=repetition_penalty,
+                        min_p=min_p,
+                        top_p=top_p,
+                    ):
+                        if not chunk:
+                            continue
+                        await websocket.send_bytes(chunk)
+                        chunk_count += 1
+                finally:
+                    # Clean up any temporary reference audio file we downloaded.
+                    if audio_prompt_path:
+                        try:
+                            Path(audio_prompt_path).unlink(missing_ok=True)
+                        except Exception:
+                            pass
 
                 await websocket.send_json({
                     "type": "complete",

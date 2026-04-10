@@ -1,5 +1,10 @@
 # Caddyfile for audio-inference.oshara.ai
-# Routes requests to the ASR (STT) and TTS services.
+# Routes HTTPS/WSS requests to STT, TTS, and LiveKit (signaling + Twirp API).
+#
+# Browser / SDK URL: wss://audio-inference.oshara.ai
+# (LiveKit appends /rtc for signaling; Twirp uses /twirp/*.)
+# Media still uses UDP on the host: TURN 3478/udp + RTC range (e.g. 50000-50100/udp)
+# and tcp 7881 as configured on the LiveKit server — open those in the AWS security group.
 
 audio-inference.oshara.ai {
     # Proxy STT (ASR) API under /stt/* to the ASR container on shared Docker network
@@ -12,19 +17,46 @@ audio-inference.oshara.ai {
         reverse_proxy host.docker.internal:4000
     }
 
-    # Fallback: direct root path to a simple status message or redirect
-    handle_path / {
-        respond "audio-inference reverse proxy: use /stt/ or /tts/" 200
+    # Session token issuer (LiveKit JWT): canonical v1 path + compatibility aliases
+    @token_issuer path /v1/session-token /session-token /livekit/session-token /livekit/v1/session-token
+    handle @token_issuer {
+        reverse_proxy host.docker.internal:8787
     }
 
-    # Enable request logging
+    # LiveKit: WebSocket signaling (/rtc*) and HTTP Twirp API (/twirp*)
+    @livekit path /rtc* /twirp*
+    handle @livekit {
+        reverse_proxy host.docker.internal:7880 {
+            flush_interval -1
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # Optional prefix: client may use wss://audio-inference.oshara.ai/livekit (path → /rtc, /twirp, …)
+    handle_path /livekit/* {
+        reverse_proxy host.docker.internal:7880 {
+            flush_interval -1
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # Fallback: simple discovery text
+    handle {
+        respond "audio-inference.oshara.ai — use /stt/, /tts/, /rtc, /twirp/, or /livekit/* (see README)." 200
+    }
+
     log {
         output stdout
         format console
         level INFO
     }
 
-    # Add security headers
     header {
         X-Content-Type-Options nosniff
         X-XSS-Protection "1; mode=block"

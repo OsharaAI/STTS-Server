@@ -83,6 +83,7 @@ from routers.stt import get_stt_engine
 from routers import multilingual_tts
 from routers import pcm_tts
 from routers import streaming_tts
+from routers import chatterbox_streaming
 
 try:
     from langdetect import detect
@@ -492,6 +493,7 @@ app.include_router(websocket_conversation_v2.router)  # New modular conversation
 app.include_router(multilingual_tts.router)  # Multilingual TTS
 app.include_router(pcm_tts.router)  # PCM TTS
 app.include_router(streaming_tts.router)  # Streaming TTS
+app.include_router(chatterbox_streaming.router)  # Chatterbox voice-clone streaming
 
 # --- Static Files and HTML Templates ---
 ui_static_path = Path(__file__).parent / "ui"
@@ -553,7 +555,11 @@ async def get_web_ui(request: Request):
     """Serves the main web interface (index.html)."""
     logger.info("Request received for main UI page ('/').")
     try:
-        return templates.TemplateResponse("index.html", {"request": request})
+        return templates.TemplateResponse(
+            request=request,
+            name="index.html",
+            context={"request": request},
+        )
     except Exception as e_render:
         logger.error(f"Error rendering main UI page: {e_render}", exc_info=True)
         return HTMLResponse(
@@ -935,7 +941,7 @@ async def custom_tts_endpoint(
     reference_audio_url: Optional[str] = Form(None),
     output_format: str = Form("wav"),
     split_text: bool = Form(True),
-    chunk_size: int = Form(120),
+    chunk_size: int = Form(320),
     temperature: Optional[float] = Form(None),
     exaggeration: Optional[float] = Form(None),
     cfg_weight: Optional[float] = Form(None),
@@ -1041,7 +1047,7 @@ async def custom_tts_endpoint(
         None  # SR from the TTS engine (e.g., 24000 Hz)
     )
 
-    chunk_size_to_use = chunk_size if chunk_size is not None else 120
+    chunk_size_to_use = chunk_size if chunk_size is not None else 320
     should_split = split_text or len(text) > (chunk_size_to_use * 1.5)
     if should_split:
         logger.info(f"Splitting text into chunks of size ~{chunk_size_to_use}.")
@@ -1449,7 +1455,7 @@ async def generate_speech_endpoint(
     top_p: float = Form(1.0, description="Top-p/nucleus sampling (0.0-1.0)"),
     repetition_penalty: float = Form(1.2, description="Repetition penalty (1.0-2.0)"),
     split_text: bool = Form(True, description="Whether to split text into chunks"),
-    chunk_size: int = Form(120, description="Target chunk size for text splitting (50-500)", ge=50, le=500),
+    chunk_size: int = Form(320, description="Target chunk size for text splitting (50-500)", ge=50, le=500),
     language_id: Optional[str] = Form('ne', description="Language code for multilingual model (e.g., 'en', 'fr', 'es', 'zh')"),
 ):
     """
