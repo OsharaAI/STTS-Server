@@ -1,0 +1,11 @@
+finetuned_models/
+*.pt
+venv/
+.venv/
+__pycache__/
+model_cache/
+hf_cache/
+logs/
+voices/
+reference_audio/
+outputs/

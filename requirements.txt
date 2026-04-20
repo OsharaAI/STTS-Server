@@ -72,3 +72,4 @@ nepali-num2word              # Convert Nepali numerals to words
 #    - libsndfile (for soundfile package)
 #    - FFmpeg (for some audio processing features)
 # ============================================================================
+prometheus-fastapi-instrumentator

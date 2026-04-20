@@ -14,7 +14,7 @@ audio-inference.oshara.ai {
 
     # Proxy TTS endpoints under /tts/* to the Chatterbox TTS server
     handle_path /tts/* {
-        reverse_proxy host.docker.internal:4000
+        reverse_proxy chatterbox-streaming-multilingual:8010
     }
 
     # Session token issuer (LiveKit JWT): canonical v1 path + compatibility aliases

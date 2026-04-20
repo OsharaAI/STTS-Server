@@ -182,6 +182,10 @@ def punc_norm(text: str) -> str:
     if not any(text.endswith(p) for p in sentence_enders):
         text += "."
 
+    # Remove any remaining problematic control characters
+    # Keep only printable characters and common Unicode spaces/punctuation
+    text = "".join(c for c in text if c.isprintable() or c in ('\n', '\t', ' '))
+
     return text
 
 
@@ -306,6 +310,18 @@ class ChatterboxMultilingualTTS:
 
         s3gen_ref_wav = s3gen_ref_wav[:self.DEC_COND_LEN]
         s3gen_ref_dict = self.s3gen.embed_ref(s3gen_ref_wav, S3GEN_SR, device=self.device)
+
+        # Validate and clamp prompt_token from voice conditioning
+        if "prompt_token" in s3gen_ref_dict and s3gen_ref_dict["prompt_token"] is not None:
+            prompt_token = s3gen_ref_dict["prompt_token"]
+            max_val = prompt_token.max().item()
+            SPEECH_VOCAB_SIZE = 6561  # From S3 tokenizer config
+            if max_val >= SPEECH_VOCAB_SIZE:
+                logger.warning(
+                    f"Voice cloning: prompt_token contains out-of-range values (max={max_val}, vocab_size={SPEECH_VOCAB_SIZE}). "
+                    f"This may indicate corrupted reference audio. Clamping to valid range."
+                )
+                s3gen_ref_dict["prompt_token"] = torch.clamp(prompt_token, min=0, max=SPEECH_VOCAB_SIZE - 1)
 
         # Speech cond prompt tokens
         t3_cond_prompt_tokens = None

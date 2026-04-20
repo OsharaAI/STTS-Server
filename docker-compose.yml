@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Caddy reverse proxy for HTTPS
   caddy:
@@ -17,58 +15,95 @@ services:
       - chatterbox-network
       - stt-network
     depends_on:
-      - chatterbox-tts-server
+      - chatterbox-streaming-multilingual
     # Ensure the container can reach services bound to the Docker host (ASR/TTS)
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-  chatterbox-tts-server:
-    build:
-      args:
-      # Can be nvidia or cpu; Default is Nvidia
-        - RUNTIME=nvidia
-      context: .
-      dockerfile: Dockerfile
-    # Remove external port exposure - only accessible via Caddy
-    ports:
-      - "${PORT:-4000}:8004"
-    networks:
-      - chatterbox-network
-    volumes:
-      # Bind-mount application source for live code updates in development
-      - .:/app
-      # Mount local config file for persistence
-      - ./config.yaml:/app/config.yaml
-      # Mount local directories for persistent app data
-      - ./voices:/app/voices
-      - ./reference_audio:/app/reference_audio
-      - ./outputs:/app/outputs
-      - ./logs:/app/logs
-      # Named volume for Hugging Face model cache to persist across container rebuilds
-      - hf_cache:/app/hf_cache
-    
-    # --- GPU Support (NVIDIA) ---
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+  # chatterbox-tts-server:
+  #   build:
+  #     args:
+  #     # Can be nvidia or cpu; Default is Nvidia
+  #       - RUNTIME=nvidia
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   # Remove external port exposure - only accessible via Caddy
+  #   ports:
+  #     - "${PORT:-4000}:8004"
+  #   networks:
+  #     - chatterbox-network
+  #   volumes:
+  #     # Bind-mount application source for live code updates in development
+  #     - .:/app
+  #     # Mount local config file for persistence
+  #     - ./config.yaml:/app/config.yaml
+  #     # Mount local directories for persistent app data
+  #     - ./voices:/app/voices
+  #     - ./reference_audio:/app/reference_audio
+  #     - ./outputs:/app/outputs
+  #     - ./logs:/app/logs
+  #     # Named volume for Hugging Face model cache to persist across container rebuilds
+  #     - hf_cache:/app/hf_cache
+  #
+  #   # --- GPU Support (NVIDIA) ---
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+  #
+  #   restart: unless-stopped
+  #   environment:
+  #     # Enable faster Hugging Face downloads inside the container
+  #     - HF_HUB_ENABLE_HF_TRANSFER=1
+  #     # Make NVIDIA GPUs visible and specify capabilities for PyTorch
+  #     - NVIDIA_VISIBLE_DEVICES=all
+  #     - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+  #     # Reduce CUDA memory fragmentation for long-running generation workloads
+  #     - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+  #     # Debugging: force synchronous CUDA error reporting for accurate stack traces
+  #     - CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING:-1}
+  #     # Only effective if PyTorch is built from source with TORCH_USE_CUDA_DSA at build time
+  #     - TORCH_USE_CUDA_DSA=${TORCH_USE_CUDA_DSA:-1}
 
-    restart: unless-stopped
+  chatterbox-streaming-multilingual:
+    image: python:3.10
+    working_dir: /home/ubuntu/chatterbox-streaming-multilingual
+    cpus: "3.0"
+    command: >-
+      bash -lc "python -m ensurepip --upgrade &&
+      python -m pip install --root-user-action=ignore 'setuptools<81' &&
+      python -m pip install --root-user-action=ignore --extra-index-url https://download.pytorch.org/whl/cu124 torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 &&
+      python -m pip install --root-user-action=ignore -e . &&
+      python -m uvicorn streaming_api:app --host 0.0.0.0 --port 8010 &
+      UVICORN_PID=$$! &&
+      timeout 900 bash -lc 'until python -c \"import urllib.request; urllib.request.urlopen(\\\"http://127.0.0.1:8010/health\\\", timeout=2)\" >/dev/null 2>&1; do sleep 1; done' &&
+      (curl -fsS --max-time 1800 http://127.0.0.1:8010/warmup >/dev/null && echo 'Warmup GET status: 200') ||
+      (curl -fsS -X POST --max-time 1800 http://127.0.0.1:8010/warmup >/dev/null && echo 'Warmup POST status: 200') ||
+      echo 'Warmup skipped due to non-2xx response' &&
+      wait $$UVICORN_PID"
+    ports:
+      - "8010:8010"
     environment:
-      # Enable faster Hugging Face downloads inside the container
-      - HF_HUB_ENABLE_HF_TRANSFER=1
-      # Make NVIDIA GPUs visible and specify capabilities for PyTorch
+      - PIP_ROOT_USER_ACTION=ignore
+      - CHATTERBOX_MTL_CKPT_DIR=/models/merged_model
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-      # Reduce CUDA memory fragmentation for long-running generation workloads
-      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-      # Debugging: force synchronous CUDA error reporting for accurate stack traces
-      - CUDA_LAUNCH_BLOCKING=${CUDA_LAUNCH_BLOCKING:-1}
-      # Only effective if PyTorch is built from source with TORCH_USE_CUDA_DSA at build time
-      - TORCH_USE_CUDA_DSA=${TORCH_USE_CUDA_DSA:-1}
+      - OMP_NUM_THREADS=3
+      - OPENBLAS_NUM_THREADS=3
+      - MKL_NUM_THREADS=3
+      - NUMEXPR_NUM_THREADS=3
+      - TORCH_NUM_THREADS=3
+      - TORCH_NUM_INTEROP_THREADS=1
+    networks:
+      - chatterbox-network
+    gpus: all
+    volumes:
+      - ../chatterbox-streaming-multilingual:/home/ubuntu/chatterbox-streaming-multilingual
+      - ./finetuned_models/video-rendering-inference-server/chatterbox-finetuning-multilingual/checkpoints_lora/merged_model:/models/merged_model:ro
+    restart: unless-stopped
 
 # Define the named volumes
 volumes:

@@ -465,6 +465,9 @@ app = FastAPI(
     root_path="/tts",
 )
 
+from prometheus_fastapi_instrumentator import Instrumentator
+Instrumentator().instrument(app).expose(app)
+
 # --- CORS Middleware ---
 app.add_middleware(
     CORSMiddleware,

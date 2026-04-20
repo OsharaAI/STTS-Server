@@ -4,11 +4,14 @@
 
 import logging
 import os
+import base64
 import numpy as np
 import shutil
 import tempfile
 import torch
 import json
+import time
+import uuid
 from typing import Optional, Generator
 from pathlib import Path
 
@@ -141,6 +144,80 @@ def _audio_chunk_generator(
             fade_out = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
             prev_tail[-fade_samples:] *= fade_out
         yield prev_tail.tobytes()
+
+
+def _openai_sse_stream_generator(
+    text: str,
+    audio_prompt_path: Optional[str],
+    temperature: float,
+    exaggeration: float,
+    cfg_weight: float,
+    seed: int,
+    chunk_size: int,
+    language_id: Optional[str],
+    repetition_penalty: float,
+    min_p: float,
+    top_p: float,
+) -> Generator[bytes, None, None]:
+    """
+    OpenAI-compatible SSE stream wrapper.
+
+    Each SSE event is a chat-completion-chunk envelope where
+    choices[0].delta.content contains base64 audio bytes.
+    """
+    stream_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+    model_name = os.getenv("OPENAI_STREAM_MODEL_NAME", "chatterbox-streaming-tts")
+    sample_rate = _resolve_sample_rate()
+
+    for raw_chunk in _audio_chunk_generator(
+        text=text,
+        audio_prompt_path=audio_prompt_path,
+        temperature=temperature,
+        exaggeration=exaggeration,
+        cfg_weight=cfg_weight,
+        seed=seed,
+        chunk_size=chunk_size,
+        language_id=language_id,
+        repetition_penalty=repetition_penalty,
+        min_p=min_p,
+        top_p=top_p,
+    ):
+        encoded_chunk = base64.b64encode(raw_chunk).decode("ascii")
+        payload = {
+            "id": stream_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "content": encoded_chunk,
+                        "audio_format": "f32le",
+                        "sample_rate": sample_rate,
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+        yield f"data: {json.dumps(payload, separators=(',', ':'))}\n\n".encode("utf-8")
+
+    final_payload = {
+        "id": stream_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    yield f"data: {json.dumps(final_payload, separators=(',', ':'))}\n\n".encode("utf-8")
+    yield b"data: [DONE]\n\n"
 
 
 @router.post(
@@ -285,6 +362,137 @@ async def generate_stream(
             "X-Sample-Rate": str(sample_rate),
             "X-Encoding": "float32",
         }
+    )
+
+
+@router.post(
+    "/generate-stream-openai",
+    summary="Generate Streaming Audio (OpenAI-Compatible)",
+    description="Generate text-to-speech audio and stream it as OpenAI-compatible SSE chunks.",
+)
+async def generate_stream_openai(
+    background_tasks: BackgroundTasks,
+    text: str = Form(..., description="Text to convert to speech"),
+    reference_audio: Optional[UploadFile] = File(None, description="Optional reference audio file for voice cloning"),
+    reference_audio_url: Optional[str] = Form(None, description="Optional reference audio URL for voice cloning (http/https/s3)"),
+    exaggeration: float = Form(0.5, description="Voice exaggeration level (0.25-2.0)"),
+    temperature: float = Form(0.8, description="Sampling temperature (0.05-5.0)"),
+    cfg_weight: Optional[float] = Form(None, description="Classifier-free guidance weight (0.2-1.0)"),
+    seed: int = Form(0, description="Random seed (0 for random)"),
+    speed_factor: Optional[float] = Form(None, description="Global speech speed factor (0.25-4.0)"),
+    diffusion_steps: int = Form(10, description="Number of diffusion steps (1-15)"),
+    min_p: float = Form(0.05, description="Minimum probability sampler (0.0-1.0)"),
+    top_p: float = Form(1.0, description="Top-p/nucleus sampling (0.0-1.0)"),
+    repetition_penalty: float = Form(1.2, description="Repetition penalty (1.0-2.0)"),
+    split_text: bool = Form(True, description="Whether to split text into chunks"),
+    chunk_size: int = Form(
+        DEFAULT_STREAM_CHUNK_SIZE,
+        description="Speech token chunk size for streaming (lower = faster first chunk)",
+        ge=MIN_STREAM_CHUNK_SIZE,
+        le=MAX_STREAM_CHUNK_SIZE,
+    ),
+    language_id: Optional[str] = Form("ne", description="Language code for multilingual model (e.g., 'en', 'fr', 'es', 'zh')"),
+):
+    """
+    Generate TTS audio and stream SSE chunks in OpenAI-compatible format.
+    """
+    logger.info(
+        f"Received OpenAI-compatible streaming TTS request: text='{text[:30]}...', "
+        f"reference_audio={'provided' if reference_audio and reference_audio.filename else 'none'}, "
+        f"exaggeration={exaggeration}, temperature={temperature}, cfg_weight={cfg_weight}, "
+        f"seed={seed}, speed_factor={speed_factor}, diffusion_steps={diffusion_steps}, "
+        f"min_p={min_p}, top_p={top_p}, repetition_penalty={repetition_penalty}, "
+        f"split_text={split_text}, chunk_size={chunk_size}, language_id={language_id}"
+    )
+
+    if not text or not text.strip():
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
+
+    if not engine.MODEL_LOADED:
+        logger.error("TTS model not loaded")
+        raise HTTPException(
+            status_code=503,
+            detail="TTS engine model is not currently loaded or available."
+        )
+    if engine.has_cuda_device_assert():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "CUDA device-side assert was triggered in this server process. "
+                "Restart the container/process, then retry with CUDA_LAUNCH_BLOCKING=1 for accurate stack traces."
+            ),
+        )
+
+    audio_prompt_path = None
+    if reference_audio and reference_audio.filename:
+        allowed_extensions = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
+        file_ext = Path(reference_audio.filename).suffix.lower()
+        if file_ext not in allowed_extensions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported reference audio format: {file_ext}. Supported: {', '.join(allowed_extensions)}",
+            )
+
+        temp_ref = tempfile.NamedTemporaryFile(delete=False, suffix=file_ext)
+        try:
+            shutil.copyfileobj(reference_audio.file, temp_ref)
+            temp_ref.close()
+            audio_prompt_path = temp_ref.name
+            background_tasks.add_task(lambda p: Path(p).unlink(missing_ok=True), temp_ref.name)
+        except Exception as e:
+            logger.error(f"Error processing reference audio: {e}", exc_info=True)
+            raise HTTPException(status_code=400, detail=f"Failed to process reference audio: {str(e)}")
+        finally:
+            await reference_audio.close()
+    elif reference_audio_url:
+        downloaded = utils.download_audio_from_url(reference_audio_url)
+        if downloaded is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to download reference_audio_url: {reference_audio_url}",
+            )
+        audio_prompt_path = str(downloaded)
+        background_tasks.add_task(
+            lambda p: Path(p).unlink(missing_ok=True),
+            audio_prompt_path,
+        )
+
+    if any([
+        speed_factor is not None,
+        diffusion_steps != 10,
+        min_p != 0.05,
+        top_p != 1.0,
+        repetition_penalty != 1.2,
+        split_text is not True,
+    ]):
+        logger.debug(
+            "OpenAI stream endpoint received /generate-compatible params that are currently ignored by stream backend: "
+            f"speed_factor={speed_factor}, diffusion_steps={diffusion_steps}, min_p={min_p}, "
+            f"top_p={top_p}, repetition_penalty={repetition_penalty}, split_text={split_text}"
+        )
+
+    cfg_weight = cfg_weight if cfg_weight is not None else get_gen_default_cfg_weight()
+
+    return StreamingResponse(
+        _openai_sse_stream_generator(
+            text=text,
+            audio_prompt_path=audio_prompt_path,
+            temperature=temperature,
+            exaggeration=exaggeration,
+            cfg_weight=cfg_weight,
+            seed=seed,
+            chunk_size=chunk_size,
+            language_id=language_id,
+            repetition_penalty=repetition_penalty,
+            min_p=min_p,
+            top_p=top_p,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 

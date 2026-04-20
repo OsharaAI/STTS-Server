@@ -96,11 +96,12 @@ async def stream_voice_clone(
     cfg_weight = cfg_weight if cfg_weight is not None else get_gen_default_cfg_weight()
 
     logger.info(
-        "Streaming request | text_len=%s | voice_clone=%s | language=%s | chunk_size=%s",
+        "Streaming request | text_len=%s | voice_clone=%s | language=%s | chunk_size=%s \n text=%s",
         len(text),
         bool(audio_prompt_path),
         language_id,
         chunk_size,
+        text
     )
 
     def audio_chunk_generator() -> Generator[bytes, None, None]:
