@@ -77,7 +77,7 @@ services:
       python -m pip install --root-user-action=ignore 'setuptools<81' &&
       python -m pip install --root-user-action=ignore --extra-index-url https://download.pytorch.org/whl/cu124 torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 &&
       python -m pip install --root-user-action=ignore -e . &&
-      python -m uvicorn streaming_api:app --host 0.0.0.0 --port 8010 &
+      python -m uvicorn streaming_api:app --host 0.0.0.0 --workers 2 --port 8010 &
       UVICORN_PID=$$! &&
       timeout 900 bash -lc 'until python -c \"import urllib.request; urllib.request.urlopen(\\\"http://127.0.0.1:8010/health\\\", timeout=2)\" >/dev/null 2>&1; do sleep 1; done' &&
       (curl -fsS --max-time 1800 http://127.0.0.1:8010/warmup >/dev/null && echo 'Warmup GET status: 200') ||
