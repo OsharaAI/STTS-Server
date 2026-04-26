@@ -102,7 +102,7 @@ services:
     gpus: all
     volumes:
       - ../chatterbox-streaming-multilingual:/home/ubuntu/chatterbox-streaming-multilingual
-      - ./finetuned_models/video-rendering-inference-server/chatterbox-finetuning-multilingual/checkpoints_lora/merged_model:/models/merged_model:ro
+      - ../chatterbox-streaming-multilingual/local_model/merged_model:/models/merged_model:ro
     restart: unless-stopped
 
 # Define the named volumes
