@@ -17,6 +17,11 @@ audio-inference.oshara.ai {
         reverse_proxy chatterbox-streaming-multilingual:8010
     }
 
+    # Proxy Model Updater API under /model-updater/*
+    handle_path /model-updater/* {
+        reverse_proxy host.docker.internal:8002
+    }
+
     # Session token issuer (LiveKit JWT): canonical v1 path + compatibility aliases
     @token_issuer path /v1/session-token /session-token /livekit/session-token /livekit/v1/session-token
     handle @token_issuer {
@@ -61,5 +66,15 @@ audio-inference.oshara.ai {
         X-Content-Type-Options nosniff
         X-XSS-Protection "1; mode=block"
         X-Frame-Options DENY
+    }
+}
+
+monitor.oshara.ai {
+    reverse_proxy host.docker.internal:3000
+
+    log {
+        output stdout
+        format console
+        level INFO
     }
 }
