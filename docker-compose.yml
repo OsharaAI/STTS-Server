@@ -97,12 +97,17 @@ services:
       - NUMEXPR_NUM_THREADS=3
       - TORCH_NUM_THREADS=3
       - TORCH_NUM_INTEROP_THREADS=1
+      - CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+      - CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-log
+    ipc: host
     networks:
       - chatterbox-network
     gpus: all
     volumes:
       - ../chatterbox-streaming-multilingual:/home/ubuntu/chatterbox-streaming-multilingual
       - ../chatterbox-streaming-multilingual/local_model/merged_model:/models/merged_model:ro
+      - /tmp/nvidia-mps:/tmp/nvidia-mps
+      - /tmp/nvidia-log:/tmp/nvidia-log
     restart: unless-stopped
 
 # Define the named volumes

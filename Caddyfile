@@ -22,6 +22,11 @@ audio-inference.oshara.ai {
         reverse_proxy host.docker.internal:8002
     }
 
+    # Proxy MCP server under /mcp/*
+    handle_path /mcp* {
+        reverse_proxy host.docker.internal:8008
+    }
+
     # Session token issuer (LiveKit JWT): canonical v1 path + compatibility aliases
     @token_issuer path /v1/session-token /session-token /livekit/session-token /livekit/v1/session-token
     handle @token_issuer {
