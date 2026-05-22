@@ -77,7 +77,8 @@ services:
       python -m pip install --root-user-action=ignore 'setuptools<81' &&
       python -m pip install --root-user-action=ignore --extra-index-url https://download.pytorch.org/whl/cu124 torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 &&
       python -m pip install --root-user-action=ignore -e . &&
-      python -m uvicorn streaming_api:app --host 0.0.0.0 --workers 2 --port 8010 &
+      export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$(find /usr/local/lib/python3.10/site-packages/nvidia -name lib -type d | tr '\n' ':') &&
+      python -m uvicorn streaming_api:app --host 0.0.0.0 --workers 1 --port 8010 &
       UVICORN_PID=$$! &&
       timeout 900 bash -lc 'until python -c \"import urllib.request; urllib.request.urlopen(\\\"http://127.0.0.1:8010/health\\\", timeout=2)\" >/dev/null 2>&1; do sleep 1; done' &&
       (curl -fsS --max-time 1800 http://127.0.0.1:8010/warmup >/dev/null && echo 'Warmup GET status: 200') ||
@@ -99,6 +100,16 @@ services:
       - TORCH_NUM_INTEROP_THREADS=1
       - CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
       - CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-log
+      # Report CUDA kernel errors synchronously for accurate stack traces
+      - CUDA_LAUNCH_BLOCKING=1
+      # Reduce CUDA memory fragmentation for long-running generation workloads
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 600s
     ipc: host
     networks:
       - chatterbox-network

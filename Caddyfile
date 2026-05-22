@@ -12,9 +12,27 @@ audio-inference.oshara.ai {
         reverse_proxy asr:8000
     }
 
-    # Proxy TTS endpoints under /tts/* to the Chatterbox TTS server
+    # Proxy Gemma API under /gemma/* to the Gemma container on shared Docker network
+    handle_path /gemma/* {
+        reverse_proxy host.docker.internal:8022
+    }
+
+    # Proxy TTS endpoints under /tts/* to the Chatterbox TTS server.
+    # health_uri + lb_try_duration: when the container restarts after a CUDA
+    # error, Caddy will keep retrying the upstream for up to 3 minutes rather
+    # than immediately returning 502 to the caller.  Combined with the 503 +
+    # Retry-After response the server emits during its drain window, this
+    # effectively queues in-flight requests at the proxy layer.
     handle_path /tts/* {
-        reverse_proxy chatterbox-streaming-multilingual:8010
+        reverse_proxy chatterbox-streaming-multilingual:8010 {
+            health_uri        /health
+            health_interval   10s
+            health_timeout    3s
+            health_status     200
+            lb_try_duration   180s
+            lb_try_interval   3s
+            flush_interval    -1
+        }
     }
 
     # Proxy Model Updater API under /model-updater/*
@@ -25,6 +43,17 @@ audio-inference.oshara.ai {
     # Proxy MCP server under /mcp/*
     handle_path /mcp* {
         reverse_proxy host.docker.internal:8008
+    }
+
+    # MLflow Tracking UI.
+    # SCRIPT_NAME=/mlflow is set in the systemd service so Flask prefixes all
+    # URLs it generates (including JS API calls) with /mlflow. Caddy must NOT
+    # strip the prefix — pass the full path so Werkzeug can strip SCRIPT_NAME
+    # for routing. Host override is required because MLflow 3 validates Host.
+    handle /mlflow* {
+        reverse_proxy host.docker.internal:5000 {
+            header_up Host localhost
+        }
     }
 
     # Session token issuer (LiveKit JWT): canonical v1 path + compatibility aliases
