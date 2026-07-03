@@ -12,9 +12,31 @@ audio-inference.oshara.ai {
         reverse_proxy asr:8000
     }
 
+    handle_path /omnilingual-stt/* {
+        reverse_proxy host.docker.internal:8080
+    }
+
     # Proxy Gemma API under /gemma/* to the Gemma container on shared Docker network
     handle_path /gemma/* {
         reverse_proxy host.docker.internal:8022
+    }
+
+    # Proxy Kokoro TTS under /tts/kokoro/* directly to the Kokoro server
+    # (separate compose project, reached via the host port). e.g.
+    #   /tts/kokoro/generate -> kokoro:8030/generate, /tts/kokoro/ws -> /ws.
+    # More specific than /tts/* below, so Caddy matches this first.
+    handle_path /tts/kokoro/* {
+        reverse_proxy host.docker.internal:8030 {
+            flush_interval -1
+        }
+    }
+
+    # Proxy Sherpa-ONNX TTS under /tts/sherpa/* directly to the Sherpa server.
+    #   /tts/sherpa/generate -> sherpa:8020/generate, /tts/sherpa/ws -> /ws.
+    handle_path /tts/sherpa/* {
+        reverse_proxy host.docker.internal:8020 {
+            flush_interval -1
+        }
     }
 
     # Proxy TTS endpoints under /tts/* to the Chatterbox TTS server.

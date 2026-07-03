@@ -1,0 +1,1 @@
+time="2026-06-16T03:57:45Z" level=warning msg="The \"LD_LIBRARY_PATH\" variable is not set. Defaulting to a blank string."
