@@ -16,6 +16,16 @@ audio-inference.oshara.ai {
         reverse_proxy host.docker.internal:8080
     }
 
+    # Proxy WhisperX speaker-diarization API under /whisperx/* to the whisperx
+    # container on the shared Docker network (same pattern as /stt above).
+    # e.g. POST /whisperx/diarize -> whisperx:8010/diarize (multipart upload).
+    # Diarization can take seconds on long audio; keep the upstream patient.
+    handle_path /whisperx/* {
+        reverse_proxy whisperx:8010 {
+            flush_interval -1
+        }
+    }
+
     # Proxy Gemma API under /gemma/* to the Gemma container on shared Docker network
     handle_path /gemma/* {
         reverse_proxy host.docker.internal:8022
@@ -35,6 +45,18 @@ audio-inference.oshara.ai {
     #   /tts/sherpa/generate -> sherpa:8020/generate, /tts/sherpa/ws -> /ws.
     handle_path /tts/sherpa/* {
         reverse_proxy host.docker.internal:8020 {
+            flush_interval -1
+        }
+    }
+
+    # Proxy XTTS v2 Nepali TTS under /tts/xtts/* directly to the XTTS server
+    # (separate compose project at /home/ubuntu/xtts, port 8040). e.g.
+    #   /tts/xtts/generate -> :8040/generate (WAV),
+    #   /tts/xtts/generate-stream -> /generate-stream (NDJSON),
+    #   /tts/xtts/ws/stream -> /ws/stream (WebSocket).
+    # More specific than /tts/* below, so Caddy matches this first.
+    handle_path /tts/xtts/* {
+        reverse_proxy host.docker.internal:8040 {
             flush_interval -1
         }
     }
@@ -109,7 +131,7 @@ audio-inference.oshara.ai {
 
     # Fallback: simple discovery text
     handle {
-        respond "audio-inference.oshara.ai — use /stt/, /tts/, /rtc, /twirp/, or /livekit/* (see README)." 200
+        respond "audio-inference.oshara.ai — use /stt/, /tts/, /tts/xtts/, /rtc, /twirp/, or /livekit/* (see README)." 200
     }
 
     log {
